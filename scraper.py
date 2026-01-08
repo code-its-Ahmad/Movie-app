@@ -18,10 +18,9 @@ from urllib.parse import quote
 import logging
 import asyncio
 import re
-import requests
 from fastapi import HTTPException
 from typing import List, Optional, Tuple
-from models import  Anime, Episode, Movie, Series, AnimeSeriesDetail, AnimeEpisode, ToonstreamMovieDetail, SeriesDetail, SeriesEpisode, MovieDetail
+from models import Anime, Episode, Movie, Series, AnimeSeriesDetail, AnimeEpisode, ToonstreamMovieDetail, SeriesDetail, SeriesEpisode, MovieDetail, StreamingServer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +29,44 @@ logger = logging.getLogger(__name__)
 # Base URLs for scraping
 HINDILINKS_BASE_URL = "https://hindilinks4u.host"
 TOONSTREAM_BASE_URL = "https://toonstream.one"
+
+# Cache for actual base URL after redirects
+_actual_hindilinks_base_url = None
+
+async def get_actual_hindilinks_base_url(client: AsyncClient) -> str:
+    """Get the actual base URL after following redirects (hindilinks4u.host -> hindilinks4u.delivery)"""
+    global _actual_hindilinks_base_url
+    
+    if _actual_hindilinks_base_url:
+        return _actual_hindilinks_base_url
+    
+    try:
+        # Make a test request to detect the actual domain
+        response = await client.get(HINDILINKS_BASE_URL, follow_redirects=True, timeout=15.0)
+        actual_url = str(response.url)
+        # Extract base URL (protocol + domain)
+        from urllib.parse import urlparse
+        parsed = urlparse(actual_url)
+        _actual_hindilinks_base_url = f"{parsed.scheme}://{parsed.netloc}"
+        logger.info(f"Detected actual hindilinks base URL: {_actual_hindilinks_base_url}")
+        return _actual_hindilinks_base_url
+    except Exception as e:
+        logger.warning(f"Failed to detect actual base URL, using default: {e}")
+        # Try common redirect domains
+        for domain in ["hindilinks4u.delivery", "hindilinks4u.host", "hindilinks4u.net"]:
+            try:
+                test_url = f"https://{domain}"
+                test_response = await client.get(test_url, follow_redirects=True, timeout=10.0)
+                if test_response.status_code == 200:
+                    parsed = urlparse(str(test_response.url))
+                    _actual_hindilinks_base_url = f"{parsed.scheme}://{parsed.netloc}"
+                    logger.info(f"Detected actual hindilinks base URL via fallback: {_actual_hindilinks_base_url}")
+                    return _actual_hindilinks_base_url
+            except:
+                continue
+        # Fallback to original
+        _actual_hindilinks_base_url = HINDILINKS_BASE_URL
+        return _actual_hindilinks_base_url
 
 # Helper function to extract series slug from URL
 def extract_series_slug_from_url(url: str) -> Optional[str]:
@@ -128,6 +165,378 @@ def normalize_series_slug(title: str) -> str:
     # Remove leading/trailing hyphens
     slug = slug.strip('-')
     return slug
+
+# Helper function to extract server name from link/button text
+def extract_server_name(link_element, default_name: str = None) -> str:
+    """Extract server name from link text, button text, or parent element"""
+    if not link_element:
+        return default_name or "Server"
+    
+    # Try to get text from the link itself
+    text = link_element.text.strip() if hasattr(link_element, 'text') else ""
+    
+    # Common server name patterns
+    server_patterns = [
+        r'(Server\s*\d+)',
+        r'(HD\s*Server)',
+        r'(SD\s*Server)',
+        r'(720p|1080p|480p|360p)',
+        r'(DoodStream|Streamtape|Mixdrop|Vidstream|Gounlimited)',
+        r'(Watch|Stream|Play|Download)',
+    ]
+    
+    for pattern in server_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    
+    # Try parent element
+    if hasattr(link_element, 'parent') and link_element.parent:
+        parent_text = link_element.parent.get_text() if hasattr(link_element.parent, 'get_text') else ""
+        for pattern in server_patterns:
+            match = re.search(pattern, parent_text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+    
+    # Try class names
+    if hasattr(link_element, 'get'):
+        class_name = link_element.get('class', [])
+        if class_name:
+            class_str = ' '.join(class_name).lower()
+            if 'server' in class_str:
+                # Extract server number or name
+                server_match = re.search(r'server[-\s]*(\d+|[a-z]+)', class_str)
+                if server_match:
+                    return f"Server {server_match.group(1).title()}"
+    
+    return default_name or f"Server {text[:20]}" if text else "Server"
+
+# Helper function to extract quality from text or URL
+def extract_quality(text: str, url: str = "") -> Optional[str]:
+    """Extract video quality from text or URL"""
+    quality_patterns = [
+        r'\b(720p|1080p|480p|360p|240p|4K|2160p)\b',
+        r'\b(HD|SD|FHD|UHD)\b',
+        r'\b(High|Medium|Low)\s*Quality\b',
+    ]
+    
+    search_text = (text + " " + url).lower()
+    for pattern in quality_patterns:
+        match = re.search(pattern, search_text, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    
+    return None
+
+# Helper function to determine server type from URL
+def get_server_type(url: str) -> str:
+    """Determine server type from URL"""
+    url_lower = url.lower()
+    if any(x in url_lower for x in ['embed', 'iframe']):
+        return 'embed'
+    elif any(x in url_lower for x in ['.mp4', '.m3u8', 'direct', 'cdn']):
+        return 'direct'
+    elif 'drive.google' in url_lower:
+        return 'gdrive'
+    elif any(x in url_lower for x in ['dood', 'streamtape', 'mixdrop']):
+        return 'filehost'
+    else:
+        return 'iframe'
+
+# Helper function to resolve embed URLs to direct playable links
+async def resolve_embed_to_direct(client: AsyncClient, embed_url: str, max_depth: int = 3) -> Optional[str]:
+    """Recursively resolve embed URLs to find direct playable video links with comprehensive support for various hosting services"""
+    if max_depth <= 0:
+        return None
+    
+    try:
+        # Ensure embed_url is a string (handle HttpUrl objects)
+        embed_url = str(embed_url)
+        
+        # Filter out non-video URLs early to avoid unnecessary requests
+        embed_url_lower = embed_url.lower()
+        
+        # Skip non-video file types
+        non_video_extensions = ['.css', '.js', '.json', '.xml', '.txt', '.pdf', '.zip', '.rar', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico']
+        if any(ext in embed_url_lower for ext in non_video_extensions):
+            return None
+        
+        # Skip non-video domains/paths
+        non_video_keywords = ['/wp-content/', '/wp-includes/', '/themes/', '/plugins/', '/assets/', '/static/', '/css/', '/js/', '/fonts/', '/images/']
+        if any(keyword in embed_url_lower for keyword in non_video_keywords):
+            return None
+        
+        logger.debug(f"Resolving embed URL (depth {max_depth}): {embed_url}")
+        
+        # Special handling for known hosting services
+        # DoodStream pattern: extract direct link
+        if 'doodstream.com' in embed_url_lower or 'dood' in embed_url_lower or 'dood.to' in embed_url_lower:
+            try:
+                response = await client.get(embed_url, follow_redirects=True, timeout=20.0)
+                if response.status_code == 200:
+                    text = response.text
+                    # Pattern: var pass_md5 = "..."; var video_url = "...";
+                    md5_match = re.search(r'var\s+pass_md5\s*=\s*["\']([^"\']+)["\']', text)
+                    video_url_match = re.search(r'var\s+video_url\s*=\s*["\']([^"\']+)["\']', text)
+                    if md5_match and video_url_match:
+                        video_url = video_url_match.group(1)
+                        if video_url.startswith('//'):
+                            video_url = 'https:' + video_url
+                        if video_url.startswith('http') and any(ext in video_url.lower() for ext in ['.mp4', '.m3u8', 'stream', 'video']):
+                            return video_url
+                    
+                    # Alternative patterns for DoodStream
+                    patterns = [
+                        r'["\'](https?://[^"\']*dood[^"\']*\.(?:mp4|m3u8)[^"\']*)["\']',
+                        r'file["\']?\s*[:=]\s*["\'](https?://[^"\']+\.mp4[^"\']*)["\']',
+                        r'sources["\']?\s*[:=]\s*\[["\'](https?://[^"\']+\.mp4[^"\']*)["\']',
+                    ]
+                    for pattern in patterns:
+                        match = re.search(pattern, text, re.IGNORECASE)
+                        if match:
+                            url = match.group(1)
+                            if url.startswith('//'):
+                                url = 'https:' + url
+                            if url.startswith('http'):
+                                return url
+            except Exception as e:
+                logger.debug(f"DoodStream resolution attempt failed: {e}")
+        
+        # Streamtape pattern
+        if 'streamtape.com' in embed_url_lower or 'streamtape.to' in embed_url_lower:
+            try:
+                response = await client.get(embed_url, follow_redirects=True, timeout=20.0)
+                if response.status_code == 200:
+                    text = response.text
+                    # Look for get_video URL
+                    video_match = re.search(r'get_video["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']', text)
+                    if video_match:
+                        return video_match.group(1)
+                    # Alternative pattern
+                    video_match = re.search(r'robotlink["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']', text)
+                    if video_match:
+                        return video_match.group(1)
+            except Exception as e:
+                logger.debug(f"Streamtape resolution attempt failed: {e}")
+        
+        # Mixdrop pattern
+        if 'mixdrop.co' in embed_url_lower or 'mixdrop.to' in embed_url_lower or 'mixdrop' in embed_url_lower:
+            try:
+                response = await client.get(embed_url, follow_redirects=True, timeout=20.0)
+                if response.status_code == 200:
+                    text = response.text
+                    # Look for video source
+                    video_match = re.search(r'MDCore\.wurl\s*=\s*["\'](https?://[^"\']+)["\']', text)
+                    if video_match:
+                        return video_match.group(1)
+                    # Alternative patterns
+                    patterns = [
+                        r'MDCore\.wurl\s*=\s*["\'](https?://[^"\']+)["\']',
+                        r'sources["\']?\s*[:=]\s*\[["\'](https?://[^"\']+\.mp4[^"\']*)["\']',
+                        r'file["\']?\s*[:=]\s*["\'](https?://[^"\']+\.mp4[^"\']*)["\']',
+                    ]
+                    for pattern in patterns:
+                        match = re.search(pattern, text, re.IGNORECASE)
+                        if match:
+                            url = match.group(1)
+                            if url.startswith('//'):
+                                url = 'https:' + url
+                            if url.startswith('http'):
+                                return url
+            except Exception as e:
+                logger.debug(f"Mixdrop resolution attempt failed: {e}")
+        
+        # Vidstream/Vidcloud pattern
+        if 'vidstream' in embed_url_lower or 'vidcloud' in embed_url_lower:
+            try:
+                response = await client.get(embed_url, follow_redirects=True, timeout=20.0)
+                if response.status_code == 200:
+                    text = response.text
+                    soup_temp = BeautifulSoup(text, 'html.parser')
+                    # Look for iframe or video tag
+                    iframe = soup_temp.find('iframe')
+                    if iframe:
+                        iframe_src = iframe.get('src')
+                        if iframe_src:
+                            if iframe_src.startswith('//'):
+                                iframe_src = 'https:' + iframe_src
+                            if iframe_src.startswith('http'):
+                                resolved = await resolve_embed_to_direct(client, iframe_src, max_depth - 1)
+                                if resolved:
+                                    return resolved
+                    # Look for video tag
+                    video = soup_temp.find('video')
+                    if video:
+                        src = video.get('src')
+                        if src:
+                            if src.startswith('//'):
+                                src = 'https:' + src
+                            if src.startswith('http'):
+                                return src
+            except Exception as e:
+                logger.debug(f"Vidstream/Vidcloud resolution attempt failed: {e}")
+        
+        # Trembed pattern (common in hindilinks4u)
+        if 'trembed' in embed_url_lower or '/embed/' in embed_url_lower:
+            try:
+                response = await client.get(embed_url, follow_redirects=True, timeout=20.0)
+                if response.status_code == 200:
+                    text = response.text
+                    soup_temp = BeautifulSoup(text, 'html.parser')
+                    # Look for iframe
+                    iframe = soup_temp.find('iframe')
+                    if iframe:
+                        iframe_src = iframe.get('src') or iframe.get('data-src')
+                        if iframe_src:
+                            if iframe_src.startswith('//'):
+                                iframe_src = 'https:' + iframe_src
+                            if iframe_src.startswith('http'):
+                                resolved = await resolve_embed_to_direct(client, iframe_src, max_depth - 1)
+                                if resolved:
+                                    return resolved
+            except Exception as e:
+                logger.debug(f"Trembed resolution attempt failed: {e}")
+        
+        # Standard resolution
+        response = await client.get(embed_url, follow_redirects=True, timeout=20.0)
+        
+        if response.status_code != 200:
+            return None
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Priority 1: Direct video sources
+        video_tag = soup.find('video')
+        if video_tag:
+            src = video_tag.get('src') or video_tag.get('data-src') or video_tag.get('data-url')
+            if src:
+                if src.startswith('//'):
+                    src = 'https:' + src
+                elif src.startswith('/'):
+                    base_url = '/'.join(embed_url.split('/')[:3])
+                    src = base_url + src
+                if src.startswith('http'):
+                    return src
+            
+            # Check source tags
+            source_tags = video_tag.find_all('source')
+            for source_tag in source_tags:
+                src = source_tag.get('src') or source_tag.get('data-src')
+                if src:
+                    if src.startswith('//'):
+                        src = 'https:' + src
+                    elif src.startswith('/'):
+                        base_url = '/'.join(embed_url.split('/')[:3])
+                        src = base_url + src
+                    if src.startswith('http') and any(ext in src.lower() for ext in ['.mp4', '.m3u8', '.webm', '.mkv', '.flv']):
+                        return src
+        
+        # Priority 2: Iframe sources (recursive)
+        iframes = soup.find_all('iframe')
+        for iframe in iframes:
+            iframe_src = iframe.get('src') or iframe.get('data-src') or iframe.get('data-url') or iframe.get('data-frame')
+            if iframe_src:
+                if iframe_src.startswith('//'):
+                    iframe_src = 'https:' + iframe_src
+                elif iframe_src.startswith('/'):
+                    base_url = '/'.join(embed_url.split('/')[:3])
+                    iframe_src = base_url + iframe_src
+                
+                if iframe_src.startswith('http'):
+                    # Filter out social media and ads
+                    exclude_domains = ['facebook', 'twitter', 'instagram', 'youtube.com/channel', 'google', 'ads', 'advertisement']
+                    if not any(exclude in iframe_src.lower() for exclude in exclude_domains):
+                        # Recursively resolve
+                        resolved = await resolve_embed_to_direct(client, iframe_src, max_depth - 1)
+                        if resolved:
+                            return resolved
+        
+        # Priority 3: Script-based redirects or video URLs (comprehensive patterns)
+        scripts = soup.find_all('script')
+        for script in scripts:
+            script_text = script.string or ""
+            if not script_text:
+                continue
+            
+            # Comprehensive patterns for video URLs
+            patterns = [
+                r'["\'](https?://[^"\']+\.(?:mp4|m3u8|webm|mkv|flv)[^"\']*)["\']',
+                r'src["\']?\s*[:=]\s*["\'](https?://[^"\']+\.(?:mp4|m3u8|webm|mkv)[^"\']*)["\']',
+                r'file["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                r'url["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                r'video["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                r'stream["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                r'source["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                r'fileurl["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                r'video_url["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                r'videoUrl["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                r'getElementById\(["\']([^"\']+)["\']\)\.src\s*=\s*["\'](https?://[^"\']+)["\']',
+                r'\.setAttribute\(["\']src["\'],\s*["\'](https?://[^"\']+)["\']',
+                r'iframe\.src\s*=\s*["\'](https?://[^"\']+)["\']',
+                r'player\.src\s*=\s*["\'](https?://[^"\']+)["\']',
+                r'sources["\']?\s*[:=]\s*\[["\'](https?://[^"\']+\.mp4[^"\']*)["\']',
+                r'jwplayer\(["\']([^"\']+)["\']\)\.setup\([^}]+file["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+            ]
+            
+            for pattern in patterns:
+                matches = re.findall(pattern, script_text, re.IGNORECASE)
+                for match in matches:
+                    # Handle tuple matches
+                    url = match[1] if isinstance(match, tuple) and len(match) > 1 else match
+                    if isinstance(match, tuple):
+                        url = match[1] if len(match) > 1 else match[0]
+                    else:
+                        url = match
+                    
+                    if url and url.startswith('http'):
+                        # Check if it looks like a video URL
+                        video_indicators = ['.mp4', '.m3u8', '.webm', '.mkv', '.flv', 'video', 'stream', 'cdn', 'media', 'dood', 'streamtape', 'mixdrop']
+                        if any(indicator in url.lower() for indicator in video_indicators):
+                            # Exclude common non-video URLs
+                            exclude_keywords = ['analytics', 'tracking', 'advert', 'ads', 'facebook', 'twitter', 'instagram', 'google-analytics', 'doubleclick']
+                            if not any(exclude in url.lower() for exclude in exclude_keywords):
+                                return url
+        
+        # Priority 4: Look for data attributes with video URLs
+        elements_with_data = soup.find_all(attrs=lambda x: x and any(k.startswith('data-') for k in x.keys()))
+        for elem in elements_with_data:
+            for attr, value in elem.attrs.items():
+                if attr.startswith('data-') and isinstance(value, str) and value.startswith('http'):
+                    if any(ext in value.lower() for ext in ['.mp4', '.m3u8', '.webm', 'video', 'stream', 'cdn']):
+                        exclude_keywords = ['analytics', 'tracking', 'advert', 'ads']
+                        if not any(exclude in value.lower() for exclude in exclude_keywords):
+                            return value
+        
+        # Priority 5: Check for HLS/M3U8 playlists
+        m3u8_links = soup.find_all('a', href=re.compile(r'\.m3u8', re.I))
+        for link in m3u8_links:
+            href = link.get('href')
+            if href:
+                if href.startswith('//'):
+                    href = 'https:' + href
+                elif href.startswith('/'):
+                    base_url = '/'.join(embed_url.split('/')[:3])
+                    href = base_url + href
+                if href.startswith('http'):
+                    return href
+        
+        # Priority 6: Check for window.location redirects
+        for script in scripts:
+            script_text = script.string or ""
+            if not script_text:
+                continue
+            redirect_match = re.search(r'window\.location\.(?:href|replace)\s*=\s*["\'](https?://[^"\']+)["\']', script_text, re.IGNORECASE)
+            if redirect_match:
+                redirect_url = redirect_match.group(1)
+                if redirect_url.startswith('http'):
+                    resolved = await resolve_embed_to_direct(client, redirect_url, max_depth - 1)
+                    if resolved:
+                        return resolved
+        
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to resolve embed {embed_url}: {e}")
+        return None
 
 # Dependency to provide HTTP client
 async def get_http_client():
@@ -340,9 +749,16 @@ async def scrape_page(url: str, client: AsyncClient, logger, semaphore: asyncio.
                         if next_url.startswith('//'):
                             next_url = 'https:' + next_url
                         elif next_url.startswith('/'):
-                            next_url = HINDILINKS_BASE_URL + next_url
+                            # Extract base URL from current request URL
+                            from urllib.parse import urlparse
+                            parsed = urlparse(url)
+                            base_url_ctx = f"{parsed.scheme}://{parsed.netloc}"
+                            next_url = base_url_ctx + next_url
                         elif not next_url.startswith(('http://', 'https://')):
-                            next_url = HINDILINKS_BASE_URL + '/' + next_url.lstrip('/')
+                            from urllib.parse import urlparse
+                            parsed = urlparse(url)
+                            base_url_ctx = f"{parsed.scheme}://{parsed.netloc}"
+                            next_url = base_url_ctx + '/' + next_url.lstrip('/')
             
             logger.debug(f"Scraped {len(items)} items from {url}, next_url: {next_url}")
             return items, next_url
@@ -364,8 +780,9 @@ async def scrape_page(url: str, client: AsyncClient, logger, semaphore: asyncio.
 
 # Function to scrape movies by search term
 async def scrape_movie_data(search_term: str, client: AsyncClient, language: Optional[str] = None, max_pages: int = 3) -> List[Movie]:
+    base_url = await get_actual_hindilinks_base_url(client)
     formatted_search_term = quote(search_term)
-    url = f"{HINDILINKS_BASE_URL}/?s={formatted_search_term}"
+    url = f"{base_url}/?s={formatted_search_term}"
     semaphore = asyncio.Semaphore(5)
     
     logger.info(f"Scraping movie search URL: {url}")
@@ -410,7 +827,8 @@ async def scrape_movies_by_year_page(year: int, page: int, client: AsyncClient) 
     if page < 1:
         raise HTTPException(status_code=400, detail="Page must be a positive integer")
     
-    url = f"{HINDILINKS_BASE_URL}/release-year/{year}/" if page == 1 else f"{HINDILINKS_BASE_URL}/release-year/{year}/page/{page}/"
+    base_url = await get_actual_hindilinks_base_url(client)
+    url = f"{base_url}/release-year/{year}/" if page == 1 else f"{base_url}/release-year/{year}/page/{page}/"
     semaphore = asyncio.Semaphore(5)
     
     movies, _ = await scrape_page(url, client, logger, semaphore, Movie)
@@ -424,7 +842,8 @@ async def scrape_movies_by_genre_page(genre: str, page: int, client: AsyncClient
     if page < 1:
         raise HTTPException(status_code=400, detail="Page must be a positive integer")
     
-    url = f"{HINDILINKS_BASE_URL}/genre/{genre}/" if page == 1 else f"{HINDILINKS_BASE_URL}/genre/{genre}/page/{page}/"
+    base_url = await get_actual_hindilinks_base_url(client)
+    url = f"{base_url}/genre/{genre}/" if page == 1 else f"{base_url}/genre/{genre}/page/{page}/"
     semaphore = asyncio.Semaphore(5)
     
     movies, _ = await scrape_page(url, client, logger, semaphore, Movie)
@@ -438,7 +857,8 @@ async def scrape_movies_by_director_page(director: str, page: int, client: Async
     if page < 1:
         raise HTTPException(status_code=400, detail="Page must be a positive integer")
     
-    url = f"{HINDILINKS_BASE_URL}/director/{director}/" if page == 1 else f"{HINDILINKS_BASE_URL}/director/{director}/page/{page}/"
+    base_url = await get_actual_hindilinks_base_url(client)
+    url = f"{base_url}/director/{director}/" if page == 1 else f"{base_url}/director/{director}/page/{page}/"
     semaphore = asyncio.Semaphore(5)
     
     movies, _ = await scrape_page(url, client, logger, semaphore, Movie)
@@ -452,7 +872,8 @@ async def scrape_series_page(page: int, client: AsyncClient) -> List[Series]:
     if page < 1:
         raise HTTPException(status_code=400, detail="Page must be a positive integer")
     
-    url = f"{HINDILINKS_BASE_URL}/series/" if page == 1 else f"{HINDILINKS_BASE_URL}/series/page/{page}/"
+    base_url = await get_actual_hindilinks_base_url(client)
+    url = f"{base_url}/series/" if page == 1 else f"{base_url}/series/page/{page}/"
     semaphore = asyncio.Semaphore(5)
     
     series, _ = await scrape_page(url, client, logger, semaphore, Series)
@@ -465,8 +886,9 @@ async def scrape_series_search(search_series: str, client: AsyncClient) -> List[
     if not search_series.strip():
         raise HTTPException(status_code=400, detail="Search query cannot be empty")
     
+    base_url = await get_actual_hindilinks_base_url(client)
     formatted_search_term = quote(search_series)
-    url = f"{HINDILINKS_BASE_URL}/series/?s={formatted_search_term}"
+    url = f"{base_url}/series/?s={formatted_search_term}"
     semaphore = asyncio.Semaphore(5)
     
     series, _ = await scrape_page(url, client, logger, semaphore, Series)
@@ -476,13 +898,17 @@ async def scrape_series_search(search_series: str, client: AsyncClient) -> List[
     return series
 
 # Helper function to parse episode data
-def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, episode: int) -> Episode:
+def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, episode: int, base_url: str = None) -> Episode:
     episode_data = {}
+    
+    # Use provided base_url or fallback to default
+    if base_url is None:
+        base_url = HINDILINKS_BASE_URL
 
     title_tag = soup.find('h1', class_='entry-title') or soup.find('h1')
     episode_data['title'] = title_tag.text.strip() if title_tag else f"{series_slug.replace('-', ' ').title()} S{season:02d}E{episode:02d}"
 
-    episode_data['url'] = f"{HINDILINKS_BASE_URL}/episode/{series_slug}-season-{season}-episode-{episode}/"
+    episode_data['url'] = f"{base_url}/episode/{series_slug}-season-{season}-episode-{episode}/"
 
     episode_data['series_title'] = series_slug.replace('-', ' ').title()
     series_title_tag = soup.find('a', href=lambda x: x and '/series/' in x)
@@ -504,38 +930,16 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
             if image_url.startswith('//'):
                 image_url = 'https:' + image_url
             elif image_url.startswith('/'):
-                image_url = HINDILINKS_BASE_URL + image_url
+                image_url = base_url + image_url
             elif not image_url.startswith(('http://', 'https://')):
-                image_url = HINDILINKS_BASE_URL + '/' + image_url.lstrip('/')
+                image_url = base_url + '/' + image_url.lstrip('/')
     episode_data['image'] = image_url
 
-    streaming_links = []
-    # Comprehensive video server extraction
-    # 1. Look for player containers and iframes
-    player_containers = soup.find_all(["div", "section"], class_=lambda x: x and ("player" in " ".join(x).lower() or "video" in " ".join(x).lower() or "embed" in " ".join(x).lower()) if x else False)
-    for container in player_containers:
-        # Check for iframe sources
-        iframes = container.find_all("iframe")
-        for iframe in iframes:
-            src = iframe.get("src") or iframe.get("data-src")
-            if src and src.startswith(('http://', 'https://')):
-                if src not in streaming_links:
-                    streaming_links.append(src)
-        # Check for video sources
-        videos = container.find_all("video")
-        for video in videos:
-            src = video.get("src")
-            if src and src.startswith(('http://', 'https://')):
-                if src not in streaming_links:
-                    streaming_links.append(src)
-            source_tags = video.find_all("source")
-            for source in source_tags:
-                src = source.get("src")
-                if src and src.startswith(('http://', 'https://')):
-                    if src not in streaming_links:
-                        streaming_links.append(src)
+    streaming_links = []  # Legacy support
+    servers = []  # New structured server list
     
-    # 2. Look for server selection buttons/links
+    # Comprehensive video server extraction with metadata
+    # 1. Look for server selection buttons/links (most reliable for server names)
     server_selectors = [
         ('a', {'class': lambda x: x and ('server' in " ".join(x).lower() or 'link' in " ".join(x).lower() or 'watch' in " ".join(x).lower()) if x else False}),
         ('button', {'class': lambda x: x and ('server' in " ".join(x).lower() or 'play' in " ".join(x).lower()) if x else False}),
@@ -545,6 +949,9 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
         ('a', {'class': 'stream-link'}),
         ('div', {'class': 'player-options'}),
     ]
+    
+    server_counter = 1
+    processed_urls = set()
     
     for tag_name, attrs in server_selectors:
         link_tags = soup.find_all(tag_name, attrs)
@@ -558,18 +965,98 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
                     if href.startswith('//'):
                         href = 'https:' + href
                     elif href.startswith('/'):
-                        href = HINDILINKS_BASE_URL + href
+                        href = base_url + href
                     elif not href.startswith(('http://', 'https://')):
                         continue
                     
-                    # Filter out unwanted links
+                    # Filter out unwanted links and non-video files
                     exclude_keywords = ['login', 'signup', 'advert', 'advertisement', 'facebook', 'twitter', 'instagram', 'youtube.com/channel']
-                    if not any(exclude in href.lower() for exclude in exclude_keywords):
-                        # Check if it's a valid streaming link
-                        streaming_domains = ['stream', 'embed', 'player', 'watch', 'video', 'play', 'server', 'cdn', 'mp4', 'm3u8']
-                        if any(domain in href.lower() for domain in streaming_domains) or 'episode' in href.lower() or 'movie' in href.lower():
-                            if href not in streaming_links:
-                                streaming_links.append(href)
+                    if any(exclude in href.lower() for exclude in exclude_keywords):
+                        continue
+                    
+                    # Filter out non-video file extensions
+                    non_video_extensions = ['.css', '.js', '.json', '.xml', '.txt', '.pdf', '.zip', '.rar', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico', '.woff', '.ttf']
+                    if any(ext in href.lower() for ext in non_video_extensions):
+                        continue
+                    
+                    # Filter out non-video paths
+                    non_video_paths = ['/wp-content/', '/wp-includes/', '/themes/', '/plugins/', '/assets/', '/static/', '/css/', '/js/', '/fonts/', '/images/']
+                    if any(path in href.lower() for path in non_video_paths):
+                        continue
+                    
+                    # Check if it's a valid streaming link
+                    streaming_domains = ['stream', 'embed', 'player', 'watch', 'video', 'play', 'server', 'cdn', 'mp4', 'm3u8']
+                    is_streaming = any(domain in href.lower() for domain in streaming_domains) or 'episode' in href.lower() or 'movie' in href.lower()
+                    
+                    if is_streaming and href not in processed_urls:
+                        processed_urls.add(href)
+                        streaming_links.append(href)  # Legacy
+                        
+                        # Extract server metadata
+                        server_name = extract_server_name(link, f"Server {server_counter}")
+                        quality = extract_quality(link.text if hasattr(link, 'text') else "", href)
+                        server_type = get_server_type(href)
+                        
+                        servers.append(StreamingServer(
+                            name=server_name,
+                            url=href,
+                            quality=quality,
+                            type=server_type
+                        ))
+                        server_counter += 1
+    
+    # 2. Look for player containers and iframes
+    player_containers = soup.find_all(["div", "section"], class_=lambda x: x and ("player" in " ".join(x).lower() or "video" in " ".join(x).lower() or "embed" in " ".join(x).lower()) if x else False)
+    for container in player_containers:
+        # Check for iframe sources
+        iframes = container.find_all("iframe")
+        for iframe in iframes:
+            src = iframe.get("src") or iframe.get("data-src")
+            if src and src.startswith(('http://', 'https://')):
+                if src.startswith('//'):
+                    src = 'https:' + src
+                if src not in processed_urls:
+                    processed_urls.add(src)
+                    streaming_links.append(src)  # Legacy
+                    servers.append(StreamingServer(
+                        name=f"Embed {server_counter}",
+                        url=src,
+                        quality=extract_quality("", src),
+                        type=get_server_type(src)
+                    ))
+                    server_counter += 1
+        
+        # Check for video sources
+        videos = container.find_all("video")
+        for video in videos:
+            src = video.get("src")
+            if src and src.startswith(('http://', 'https://')):
+                if src not in processed_urls:
+                    processed_urls.add(src)
+                    streaming_links.append(src)  # Legacy
+                    servers.append(StreamingServer(
+                        name=f"Direct {server_counter}",
+                        url=src,
+                        quality=extract_quality("", src),
+                        type="direct"
+                    ))
+                    server_counter += 1
+            
+            source_tags = video.find_all("source")
+            for source in source_tags:
+                src = source.get("src")
+                if src and src.startswith(('http://', 'https://')):
+                    if src not in processed_urls:
+                        processed_urls.add(src)
+                        streaming_links.append(src)  # Legacy
+                        quality = source.get('label') or extract_quality("", src)
+                        servers.append(StreamingServer(
+                            name=f"Direct {server_counter}",
+                            url=src,
+                            quality=quality,
+                            type="direct"
+                        ))
+                        server_counter += 1
     
     # 3. Look for data attributes with video URLs
     data_attrs = ['data-url', 'data-src', 'data-link', 'data-video', 'data-embed']
@@ -578,30 +1065,126 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
         for elem in elements:
             data_url = elem.get(attr)
             if data_url and data_url.startswith(('http://', 'https://')):
-                if data_url not in streaming_links:
-                    streaming_links.append(data_url)
+                data_url_lower = str(data_url).lower()
+                # Filter out non-video files
+                non_video_extensions = ['.css', '.js', '.json', '.xml', '.txt', '.pdf', '.zip', '.rar', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico']
+                if any(ext in data_url_lower for ext in non_video_extensions):
+                    continue
+                # Filter out non-video paths
+                non_video_paths = ['/wp-content/', '/wp-includes/', '/themes/', '/plugins/', '/assets/', '/static/', '/css/', '/js/', '/fonts/', '/images/']
+                if any(path in data_url_lower for path in non_video_paths):
+                    continue
+                # Filter out unwanted domains
+                exclude_keywords = ['login', 'signup', 'advert', 'advertisement', 'facebook', 'twitter', 'instagram', 'analytics', 'tracking']
+                if any(exclude in data_url_lower for exclude in exclude_keywords):
+                    continue
+                if data_url not in processed_urls:
+                    processed_urls.add(data_url)
+                    streaming_links.append(data_url)  # Legacy
+                    servers.append(StreamingServer(
+                        name=f"Data {server_counter}",
+                        url=data_url,
+                        quality=extract_quality("", data_url),
+                        type=get_server_type(data_url)
+                    ))
+                    server_counter += 1
     
-    # 4. Extract from script tags (JSON data, embedded URLs)
+    # 4. Extract from script tags (JSON data, embedded URLs) - Enhanced
     script_tags = soup.find_all("script")
     for script in script_tags:
-        if script.string:
-            # Look for URLs in script content
-            url_patterns = [
-                r'["\'](https?://[^"\']*(?:stream|embed|player|watch|video|play|server|cdn|mp4|m3u8)[^"\']*)["\']',
-                r'url["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
-                r'src["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
-            ]
-            for pattern in url_patterns:
-                matches = re.findall(pattern, script.string, re.IGNORECASE)
-                for match in matches:
-                    if match.startswith(('http://', 'https://')):
-                        exclude_keywords = ['login', 'signup', 'advert', 'advertisement', 'facebook', 'twitter', 'instagram']
-                        if not any(exclude in match.lower() for exclude in exclude_keywords):
-                            if match not in streaming_links:
-                                streaming_links.append(match)
+        script_text = script.string or ""
+        if not script_text:
+            continue
+        
+        # Enhanced URL patterns for video links
+        url_patterns = [
+            r'["\'](https?://[^"\']*(?:stream|embed|player|watch|video|play|server|cdn|mp4|m3u8|webm|mkv|flv)[^"\']*)["\']',
+            r'url["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+            r'src["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+            r'file["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+            r'video["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+            r'source["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+            r'fileurl["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+            r'video_url["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+            r'videoUrl["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+            r'getElementById\(["\']([^"\']+)["\']\)\.src\s*=\s*["\'](https?://[^"\']+)["\']',
+            r'\.setAttribute\(["\']src["\'],\s*["\'](https?://[^"\']+)["\']',
+            r'iframe\.src\s*=\s*["\'](https?://[^"\']+)["\']',
+        ]
+        
+        for pattern in url_patterns:
+            matches = re.findall(pattern, script_text, re.IGNORECASE)
+            for match in matches:
+                # Handle tuple matches
+                url = match[1] if isinstance(match, tuple) and len(match) > 1 else match
+                if isinstance(match, tuple):
+                    url = match[1] if len(match) > 1 else match[0]
+                else:
+                    url = match
+                
+                if url and url.startswith(('http://', 'https://')):
+                    exclude_keywords = ['login', 'signup', 'advert', 'advertisement', 'facebook', 'twitter', 'instagram', 'analytics', 'tracking', 'google-analytics']
+                    if not any(exclude in url.lower() for exclude in exclude_keywords):
+                        # Check if it looks like a video URL
+                        video_indicators = ['stream', 'embed', 'player', 'watch', 'video', 'play', 'server', 'cdn', 'mp4', 'm3u8', 'webm', 'mkv', 'dood', 'streamtape', 'mixdrop']
+                        if any(indicator in url.lower() for indicator in video_indicators):
+                            if url not in processed_urls:
+                                processed_urls.add(url)
+                                streaming_links.append(url)  # Legacy
+                                servers.append(StreamingServer(
+                                    name=f"Script {server_counter}",
+                                    url=url,
+                                    quality=extract_quality("", url),
+                                    type=get_server_type(url)
+                                ))
+                                server_counter += 1
     
-    # 5. Fallback: search for any links with streaming keywords
-    if not streaming_links:
+    # 5. Look for server tabs/buttons in common player structures
+    server_tabs = soup.find_all(['div', 'li', 'button', 'a'], class_=lambda x: x and any(keyword in " ".join(x).lower() for keyword in ['server', 'tab', 'option', 'link', 'quality']) if x else False)
+    for tab in server_tabs:
+        # Check for data attributes
+        for attr in ['data-url', 'data-src', 'data-link', 'data-video', 'data-embed', 'data-server']:
+            data_url = tab.get(attr)
+            if data_url:
+                if data_url.startswith('//'):
+                    data_url = 'https:' + data_url
+                elif data_url.startswith('/'):
+                    data_url = base_url + data_url
+                elif data_url.startswith(('http://', 'https://')):
+                    if data_url not in processed_urls:
+                        processed_urls.add(data_url)
+                        streaming_links.append(data_url)  # Legacy
+                        servers.append(StreamingServer(
+                            name=extract_server_name(tab, f"Server {server_counter}"),
+                            url=data_url,
+                            quality=extract_quality(tab.text if hasattr(tab, 'text') else "", data_url),
+                            type=get_server_type(data_url)
+                        ))
+                        server_counter += 1
+        
+        # Check for nested links
+        nested_link = tab.find('a', href=True)
+        if nested_link:
+            href = nested_link.get('href')
+            if href:
+                if href.startswith('//'):
+                    href = 'https:' + href
+                elif href.startswith('/'):
+                    href = base_url + href
+                elif href.startswith(('http://', 'https://')):
+                    if href not in processed_urls:
+                        processed_urls.add(href)
+                        streaming_links.append(href)  # Legacy
+                        servers.append(StreamingServer(
+                            name=extract_server_name(nested_link, f"Server {server_counter}"),
+                            url=href,
+                            quality=extract_quality(nested_link.text if nested_link.text else "", href),
+                            type=get_server_type(href)
+                        ))
+                        server_counter += 1
+    
+    # 6. Fallback: search for any links with streaming keywords (enhanced)
+    if len(servers) < 3:  # Only if we haven't found many servers yet
         all_links = soup.find_all('a', href=True)
         for link in all_links:
             href = link.get('href')
@@ -610,17 +1193,28 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
                 if href.startswith('//'):
                     href = 'https:' + href
                 elif href.startswith('/'):
-                    href = HINDILINKS_BASE_URL + href
+                    href = base_url + href
                 elif not href.startswith(('http://', 'https://')):
                     continue
                     
-                if any(keyword in text or keyword in href.lower() for keyword in ['watch', 'stream', 'play', 'download', 'server', 'embed', 'player']):
-                    exclude_keywords = ['login', 'signup', 'advert', 'advertisement', 'facebook', 'twitter', 'instagram']
+                # Enhanced keyword matching
+                video_keywords = ['watch', 'stream', 'play', 'download', 'server', 'embed', 'player', 'video', 'mp4', 'm3u8', 'dood', 'streamtape', 'mixdrop', 'vidstream', 'gounlimited']
+                if any(keyword in text or keyword in href.lower() for keyword in video_keywords):
+                    exclude_keywords = ['login', 'signup', 'advert', 'advertisement', 'facebook', 'twitter', 'instagram', 'analytics', 'tracking']
                     if not any(exclude in href.lower() for exclude in exclude_keywords):
-                        if href not in streaming_links:
-                            streaming_links.append(href)
+                        if href not in processed_urls:
+                            processed_urls.add(href)
+                            streaming_links.append(href)  # Legacy
+                            servers.append(StreamingServer(
+                                name=extract_server_name(link, f"Server {server_counter}"),
+                                url=href,
+                                quality=extract_quality(text, href),
+                                type=get_server_type(href)
+                            ))
+                            server_counter += 1
     
-    episode_data['streaming_links'] = streaming_links
+    episode_data['streaming_links'] = streaming_links  # Legacy support
+    episode_data['servers'] = servers  # New structured format
 
     duration_tag = soup.find('div', class_='jt-info', string=lambda x: x and 'min' in x.lower() and x.strip().replace('min', '').strip().isdigit())
     episode_data['duration'] = duration_tag.text.strip() if duration_tag else None
@@ -663,7 +1257,9 @@ async def scrape_episode_data(
     if season < 1 or episode < 1:
         raise HTTPException(status_code=400, detail="Season and episode must be positive integers")
 
-    url = f"{HINDILINKS_BASE_URL}/episode/{series_slug}-season-{season}-episode-{episode}/"
+    # Get actual base URL after redirects
+    actual_base_url = await get_actual_hindilinks_base_url(client)
+    url = f"{actual_base_url}/episode/{series_slug}-season-{season}-episode-{episode}/"
     semaphore = asyncio.Semaphore(5)
 
     async with semaphore:
@@ -673,7 +1269,35 @@ async def scrape_episode_data(
             response = await client.get(url)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
-            episode_data = parse_episode(soup, logger, series_slug, season, episode)
+            # Pass actual base URL to parse_episode
+            episode_data = parse_episode(soup, logger, series_slug, season, episode, base_url=actual_base_url)
+
+            # Deep resolve embed URLs to direct playable links
+            resolved_servers = []
+            for server in episode_data.servers:
+                server_url_str = str(server.url)
+                if server.type in ['embed', 'iframe'] or '/embed/' in server_url_str.lower() or 'embed' in server_url_str.lower():
+                    # Try to resolve embed URL to direct link
+                    resolved_url = await resolve_embed_to_direct(client, server_url_str, max_depth=2)
+                    if resolved_url and resolved_url != server_url_str:
+                        # Use resolved URL if different
+                        resolved_servers.append(StreamingServer(
+                            name=server.name,
+                            url=resolved_url,
+                            quality=server.quality,
+                            type="direct" if resolved_url else server.type
+                        ))
+                    else:
+                        # Keep original if resolution failed or same
+                        resolved_servers.append(server)
+                else:
+                    # Keep non-embed links as-is
+                    resolved_servers.append(server)
+            
+            # Update episode data with resolved servers
+            episode_data.servers = resolved_servers
+            # Also update legacy streaming_links with resolved URLs
+            episode_data.streaming_links = [str(server.url) for server in resolved_servers]
 
             # Apply language filter
             if language:
@@ -707,13 +1331,17 @@ async def scrape_episode_data(
             raise HTTPException(status_code=500, detail=f"Scraping error: {str(e)}")
 
 # Helper function to parse series detail
-def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_title: Optional[str] = None) -> SeriesDetail:
+def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_title: Optional[str] = None, base_url: str = None) -> SeriesDetail:
     # 1. Metadata extraction
+    # Use provided base_url or fallback to default
+    if base_url is None:
+        base_url = HINDILINKS_BASE_URL
+        
     title_tag = soup.find('h1', class_='entry-title') or soup.find('h1')
     title = title_tag.text.strip() if title_tag else (original_title or series_slug.replace('-', ' ').title())
     
     # Extract ID from body class if available (for data-id usage generally, but mainly url here)
-    url = f"{HINDILINKS_BASE_URL}/series/{series_slug}/"
+    url = f"{base_url}/series/{series_slug}/"
     
     desc_tag = soup.find('div', class_='entry-content') or soup.find('div', class_='description') or soup.find('p', class_='f-desc')
     description = desc_tag.text.strip() if desc_tag else None
@@ -726,9 +1354,9 @@ def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_
             if image_url.startswith('//'):
                 image_url = 'https:' + image_url
             elif image_url.startswith('/'):
-                image_url = HINDILINKS_BASE_URL + image_url
+                image_url = base_url + image_url
             elif not image_url.startswith(('http://', 'https://')):
-                image_url = HINDILINKS_BASE_URL + '/' + image_url.lstrip('/')
+                image_url = base_url + '/' + image_url.lstrip('/')
     
     # Extra info
     extra_info = soup.find('div', class_='sheader') or soup.find('div', class_='extra')
@@ -762,73 +1390,205 @@ def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_
     for tag in cast_tags:
         cast.append(tag.text.strip())
 
-    # 2. Episodes Extraction
+    # 2. Episodes Extraction - Enhanced to automatically detect all episodes
     episodes = []
     seasons_count = 0
     total_episodes_count = 0
+    season_episode_map = {}  # Track episodes per season
     
+    # Method 1: Look for season containers (primary method)
     seasons_divs = soup.find_all('div', class_='se-c')
     if not seasons_divs:
         # Fallback for some layouts without 'se-c' container
         seasons_divs = soup.find_all('div', id=lambda x: x and x.startswith('season-'))
-        
+    if not seasons_divs:
+        # Additional fallback: look for divs with season-related classes
+        seasons_divs = soup.find_all('div', class_=lambda x: x and ('season' in " ".join(x).lower() or 'episode' in " ".join(x).lower()) if x else False)
+    
     for season_div in seasons_divs:
         seasons_count += 1
         
-        season_num_tag = season_div.find('span', class_='se-t') or season_div.find('div', class_='se-q')
-        season_num = "1"
+        # Extract season number from various sources
+        season_num = "1"  # Default
+        season_num_tag = season_div.find('span', class_='se-t') or season_div.find('div', class_='se-q') or season_div.find('h3') or season_div.find('h4')
         if season_num_tag:
-            # Try to extract number
             txt = season_num_tag.text.strip()
-            # Extract digits
-            digits = re.findall(r'\d+', txt)
-            if digits:
-                season_num = digits[0]
+            # Extract digits - look for "Season 1", "S1", "1", etc.
+            season_match = re.search(r'(?:season|s)[\s:]*(\d+)', txt, re.IGNORECASE)
+            if season_match:
+                season_num = season_match.group(1)
+            else:
+                digits = re.findall(r'\d+', txt)
+                if digits:
+                    season_num = digits[0]
         
+        # Also try to extract from div ID or class
+        div_id = season_div.get('id', '')
+        if div_id:
+            season_match = re.search(r'season[_-]?(\d+)', div_id, re.IGNORECASE)
+            if season_match:
+                season_num = season_match.group(1)
+        
+        # Initialize season episode counter
+        if season_num not in season_episode_map:
+            season_episode_map[season_num] = 0
+        
+        # Find episode items - try multiple selectors
         episode_list = season_div.find_all('li')
-        for ep in episode_list:
-            total_episodes_count += 1
+        if not episode_list:
+            # Try finding episode links directly
+            episode_list = season_div.find_all('a', href=lambda x: x and 'episode' in x.lower() if x else False)
+            # Convert links to list items for processing
+            episode_list = [{'tag': 'a', 'link': link, 'parent': link.find_parent('li') or link.find_parent('div')} for link in episode_list]
+        
+        for ep_item in episode_list:
+            # Handle both li elements and direct links
+            if isinstance(ep_item, dict):
+                ep_link = ep_item.get('link')
+                ep = ep_item.get('parent') or ep_link
+            else:
+                ep = ep_item
+                ep_link = ep.find('a')
             
-            ep_link = ep.find('a')
             if not ep_link:
                 continue
-                
-            ep_url = ep_link.get('href')
-            ep_title = ep_link.text.strip()
             
-            # Refine ep title if it's just "Episode 1"
-            ep_img_tag = ep.find('img')
-            ep_image_url = None
-            if ep_img_tag:
-                ep_image_url = ep_img_tag.get('src') or ep_img_tag.get('data-src')
-                if ep_image_url:
-                     if ep_image_url.startswith('//'):
-                        ep_image_url = 'https:' + ep_image_url
+            # Get episode URL
+            ep_url = ep_link.get('href') if hasattr(ep_link, 'get') else str(ep_link)
+            if not ep_url:
+                continue
             
-            desc_div = ep.find('div', class_='episodiotitle')
-            # Extract episode number from URL or title
-            # Expected URL format: .../episode/{series}-season-{s}-episode-{e}/
-            ep_num = str(total_episodes_count) # Fallback
+            # Normalize URL
+            if ep_url.startswith('//'):
+                ep_url = 'https:' + ep_url
+            elif ep_url.startswith('/'):
+                ep_url = base_url + ep_url
+            elif not ep_url.startswith(('http://', 'https://')):
+                ep_url = base_url + '/' + ep_url.lstrip('/')
             
+            # Extract episode title
+            ep_title = ep_link.text.strip() if hasattr(ep_link, 'text') else (ep.text.strip() if hasattr(ep, 'text') else f"Episode {season_episode_map[season_num] + 1}")
+            
+            # Extract episode number from URL (most reliable)
+            ep_num = None
             try:
-                if 'episode-' in ep_url:
-                    ep_num = ep_url.rstrip('/').split('episode-')[-1]
-                elif 'episode-' in ep_title.lower():
-                     match = re.search(r'episode\s*(\d+)', ep_title, re.IGNORECASE)
-                     if match:
-                         ep_num = match.group(1)
-            except Exception:
-                pass
+                # URL format: .../episode/{series}-season-{s}-episode-{e}/
+                if 'season-' in ep_url and 'episode-' in ep_url:
+                    # Extract season and episode from URL
+                    url_parts = ep_url.split('/')
+                    for part in url_parts:
+                        if 'episode-' in part:
+                            ep_match = re.search(r'episode-(\d+)', part, re.IGNORECASE)
+                            if ep_match:
+                                ep_num = ep_match.group(1)
+                                break
                 
+                # Fallback: extract from title
+                if not ep_num:
+                    ep_match = re.search(r'(?:episode|ep)[\s:]*(\d+)', ep_title, re.IGNORECASE)
+                    if ep_match:
+                        ep_num = ep_match.group(1)
+                
+                # Final fallback: use counter
+                if not ep_num:
+                    season_episode_map[season_num] += 1
+                    ep_num = str(season_episode_map[season_num])
+                else:
+                    # Update counter to match found episode number
+                    ep_num_int = int(ep_num)
+                    if ep_num_int > season_episode_map[season_num]:
+                        season_episode_map[season_num] = ep_num_int
+            except Exception as e:
+                logger.debug(f"Error extracting episode number: {e}")
+                season_episode_map[season_num] += 1
+                ep_num = str(season_episode_map[season_num])
+            
+            # Extract episode image
+            ep_image_url = None
+            if isinstance(ep, dict):
+                ep_img_tag = (ep.get('parent') or ep.get('link')).find('img') if hasattr(ep.get('parent') or ep.get('link'), 'find') else None
+            else:
+                ep_img_tag = ep.find('img')
+            
+            if ep_img_tag:
+                ep_image_url = ep_img_tag.get('src') or ep_img_tag.get('data-src') or ep_img_tag.get('data-original')
+                if ep_image_url:
+                    if ep_image_url.startswith('//'):
+                        ep_image_url = 'https:' + ep_image_url
+                    elif ep_image_url.startswith('/'):
+                        ep_image_url = base_url + ep_image_url
+                    elif not ep_image_url.startswith(('http://', 'https://')):
+                        ep_image_url = base_url + '/' + ep_image_url.lstrip('/')
+            
+            total_episodes_count += 1
             episodes.append(SeriesEpisode(
                 title=ep_title,
                 url=ep_url,
                 season=season_num,
                 episode_number=ep_num,
                 image=ep_image_url,
-                duration=None, # Usually not visible in list
+                duration=None,  # Usually not visible in list
                 language=None 
             ))
+    
+    # Method 2: If no episodes found via season containers, try finding all episode links on page
+    if not episodes:
+        logger.info(f"No episodes found via season containers, trying alternative method for {series_slug}")
+        all_episode_links = soup.find_all('a', href=lambda x: x and 'episode' in x.lower() and series_slug in x.lower() if x else False)
+        
+        # Group by season based on URL pattern
+        for ep_link in all_episode_links:
+            ep_url = ep_link.get('href')
+            if not ep_url:
+                continue
+            
+            # Normalize URL
+            if ep_url.startswith('//'):
+                ep_url = 'https:' + ep_url
+            elif ep_url.startswith('/'):
+                ep_url = base_url + ep_url
+            elif not ep_url.startswith(('http://', 'https://')):
+                ep_url = base_url + '/' + ep_url.lstrip('/')
+            
+            # Extract season and episode from URL
+            season_match = re.search(r'season-(\d+)', ep_url, re.IGNORECASE)
+            episode_match = re.search(r'episode-(\d+)', ep_url, re.IGNORECASE)
+            
+            if season_match and episode_match:
+                season_num = season_match.group(1)
+                ep_num = episode_match.group(1)
+                ep_title = ep_link.text.strip() or f"Episode {ep_num}"
+                
+                # Extract image
+                ep_image_url = None
+                parent = ep_link.find_parent(['li', 'div', 'article'])
+                if parent:
+                    img_tag = parent.find('img')
+                    if img_tag:
+                        ep_image_url = img_tag.get('src') or img_tag.get('data-src')
+                        if ep_image_url:
+                            if ep_image_url.startswith('//'):
+                                ep_image_url = 'https:' + ep_image_url
+                            elif ep_image_url.startswith('/'):
+                                ep_image_url = base_url + ep_image_url
+                
+                episodes.append(SeriesEpisode(
+                    title=ep_title,
+                    url=ep_url,
+                    season=season_num,
+                    episode_number=ep_num,
+                    image=ep_image_url,
+                    duration=None,
+                    language=None
+                ))
+        
+        # Update seasons count
+        if episodes:
+            unique_seasons = set(ep.season for ep in episodes)
+            seasons_count = len(unique_seasons)
+    
+    # Sort episodes by season and episode number
+    episodes.sort(key=lambda x: (int(x.season) if x.season.isdigit() else 0, int(x.episode_number) if x.episode_number.isdigit() else 0))
             
     # Language detection
     language = None
@@ -857,8 +1617,21 @@ def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_
     )
 
 # Function to scrape series detail
-async def scrape_series_detail(series_slug: str, client: AsyncClient) -> SeriesDetail:
-    url = f"{HINDILINKS_BASE_URL}/series/{series_slug}/"
+async def scrape_series_detail(series_slug: str, client: AsyncClient, include_servers: bool = False) -> SeriesDetail:
+    """
+    Scrape series detail page with optional server links for episodes.
+    
+    Args:
+        series_slug: Series slug identifier
+        client: Async HTTP client
+        include_servers: If True, fetch server links for each episode (slower but complete)
+    
+    Returns:
+        SeriesDetail object with episode information
+    """
+    # Get actual base URL after redirects
+    actual_base_url = await get_actual_hindilinks_base_url(client)
+    url = f"{actual_base_url}/series/{series_slug}/"
     semaphore = asyncio.Semaphore(5)
     
     async with semaphore:
@@ -868,7 +1641,66 @@ async def scrape_series_detail(series_slug: str, client: AsyncClient) -> SeriesD
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            return parse_series_detail(soup, logger, series_slug)
+            # Pass actual base URL to parse_series_detail
+            series_detail = parse_series_detail(soup, logger, series_slug, base_url=actual_base_url)
+            
+            # Optionally populate server links for each episode
+            if include_servers and series_detail.episodes:
+                logger.info(f"Fetching server links for {len(series_detail.episodes)} episodes...")
+                
+                async def fetch_episode_servers(ep: SeriesEpisode) -> SeriesEpisode:
+                    """Fetch server links for a single episode"""
+                    try:
+                        # Extract season and episode numbers from URL
+                        # URL format: .../episode/{series}-season-{s}-episode-{e}/
+                        url_str = str(ep.url)
+                        season_match = re.search(r'season-(\d+)', url_str)
+                        episode_match = re.search(r'episode-(\d+)', url_str)
+                        
+                        if season_match and episode_match:
+                            season_num = int(season_match.group(1))
+                            episode_num = int(episode_match.group(1))
+                            
+                            # Fetch episode data to get server links
+                            episode_data = await scrape_episode_data(
+                                series_slug, 
+                                season_num, 
+                                episode_num, 
+                                client, 
+                                language=None
+                            )
+                            
+                            # Update episode with server links
+                            return SeriesEpisode(
+                                title=ep.title,
+                                url=ep.url,
+                                season=ep.season,
+                                episode_number=ep.episode_number,
+                                image=ep.image,
+                                duration=ep.duration,
+                                language=ep.language,
+                                servers=episode_data.servers
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch servers for episode {ep.episode_number}: {e}")
+                        # Return original episode without servers
+                    
+                    return ep
+                
+                # Fetch all episodes concurrently (limit concurrency)
+                semaphore_episodes = asyncio.Semaphore(10)  # Limit concurrent episode fetches
+                
+                async def fetch_with_limit(ep: SeriesEpisode) -> SeriesEpisode:
+                    async with semaphore_episodes:
+                        return await fetch_episode_servers(ep)
+                
+                # Fetch all episodes
+                updated_episodes = await asyncio.gather(*[fetch_with_limit(ep) for ep in series_detail.episodes])
+                series_detail.episodes = updated_episodes
+                
+                logger.info(f"Successfully fetched server links for episodes")
+            
+            return series_detail
             
         except HTTPStatusError as e:
             logger.error(f"HTTP error while scraping {url}: {e}")
@@ -878,131 +1710,6 @@ async def scrape_series_detail(series_slug: str, client: AsyncClient) -> SeriesD
         except Exception as e:
             logger.error(f"Unexpected error while scraping {url}: {e}")
             raise HTTPException(status_code=500, detail=f"Scraping error: {str(e)}")
-
-def scrape_anime_data_sync(search_term: str) -> List[Anime]:
-    base_url = TOONSTREAM_BASE_URL.rstrip('/')
-    formatted_search_term = quote(search_term)
-    url = f"{base_url}/home/?s={formatted_search_term}"
-    
-    logger.info(f"Scraping anime search URL: {url}")
-    
-    try:
-        response = requests.get(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        })
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        
-        # Try multiple selectors to find anime items (same logic as async version)
-        articles = []
-        articles = soup.find_all("article", class_="post dfx fcl movies")
-        if not articles:
-            articles = soup.find_all("article", class_=lambda x: x and ("post" in " ".join(x) or "movies" in " ".join(x)))
-        if not articles:
-            articles = soup.find_all("div", class_=lambda x: x and ("post" in " ".join(x) or "movie" in " ".join(x) or "anime" in " ".join(x)))
-        if not articles:
-            list_container = soup.find("div", class_=lambda x: x and ("list" in " ".join(x).lower() or "grid" in " ".join(x).lower()))
-            if list_container:
-                articles = list_container.find_all(["article", "div"], recursive=True)
-        if not articles:
-            all_items = soup.find_all(["article", "div"], class_=True)
-            articles = [item for item in all_items if item.find("h2") and item.find("a")]
-        
-        if not articles:
-            logger.warning(f"No anime found for search term: {search_term}")
-            raise HTTPException(status_code=404, detail=f"No anime found for search term: {search_term}")
-        
-        anime_list = []
-        for article in articles:
-            try:
-                title = None
-                title_tag = article.find("h2", class_="entry-title") or article.find("h2") or article.find("h3")
-                if title_tag:
-                    title = title_tag.text.strip()
-                else:
-                    link_tag = article.find("a")
-                    if link_tag:
-                        title = link_tag.get("title") or link_tag.get("alt") or link_tag.text.strip()
-                
-                if not title:
-                    continue
-                
-                tmdb_rating = None
-                rating_tag = article.find("span", class_="vote") or article.find("span", class_=lambda x: x and "vote" in " ".join(x))
-                if rating_tag:
-                    rating_text = rating_tag.text.replace("TMDB", "").strip()
-                    try:
-                        tmdb_rating = float(rating_text)
-                    except ValueError:
-                        rating_match = re.search(r'(\d+\.?\d*)', rating_text)
-                        if rating_match:
-                            tmdb_rating = float(rating_match.group(1))
-                
-                image_url = None
-                img_tag = article.find("img")
-                if img_tag:
-                    image_url = img_tag.get("src") or img_tag.get("data-src") or img_tag.get("data-original") or img_tag.get("data-lazy-src")
-                    if image_url:
-                        if image_url.startswith("//"):
-                            image_url = "https:" + image_url
-                        elif image_url.startswith("/"):
-                            image_url = base_url + image_url
-                        elif not image_url.startswith(('http://', 'https://')):
-                            image_url = base_url + '/' + image_url.lstrip('/')
-                
-                series_url = None
-                link_tag = article.find("a", class_="lnk-blk") or article.find("a", href=True)
-                if link_tag:
-                    series_url = link_tag.get("href")
-                    if series_url:
-                        if series_url.startswith("//"):
-                            series_url = "https:" + series_url
-                        elif series_url.startswith("/"):
-                            series_url = base_url + series_url
-                        elif not series_url.startswith(('http://', 'https://')):
-                            series_url = base_url + '/' + series_url.lstrip('/')
-                
-                if not series_url:
-                    continue
-                
-                language = None
-                for lang in ['hindi', 'english', 'tamil', 'telugu', 'malayalam']:
-                    if lang in title.lower():
-                        language = lang
-                        break
-                
-                anime_data = {
-                    "title": title,
-                    "url": series_url,
-                    "image": image_url,
-                    "rating": str(tmdb_rating) if tmdb_rating else None,
-                    "language": language,
-                    "description": None,
-                    "genres": [],
-                    "year": None
-                }
-                
-                anime_list.append(Anime(**anime_data))
-            except Exception as e:
-                logger.error(f"Failed to parse anime item: {e}")
-                continue
-        
-        if not anime_list:
-            logger.warning(f"Could not parse any anime items from the page for search term: {search_term}")
-            raise HTTPException(status_code=404, detail=f"No anime found for search term: {search_term}")
-        
-        logger.info(f"Scraped {len(anime_list)} anime for search term: {search_term}")
-        return anime_list
-    
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error while scraping {url}: {e}")
-        raise HTTPException(status_code=502, detail=f"Failed to fetch data: {str(e)}")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Network error while scraping {url}: {e}")
-        raise HTTPException(status_code=503, detail=f"Network error: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error while scraping {url}: {e}")
-        raise HTTPException(status_code=500, detail=f"Scraping error: {str(e)}")
 
 # Async version for consistency with existing codebase
 async def scrape_anime_data(search_term: str, client: AsyncClient) -> List[Anime]:
@@ -1364,7 +2071,7 @@ async def scrape_anime_by_category(anime_category: str, page: int, client: Async
             raise HTTPException(status_code=500, detail=f"Scraping error: {str(e)}")
 
 # Function to scrape anime series detail page from toonstream.one
-async def scrape_anime_series_detail(series_slug: str, client: AsyncClient, original_title: Optional[str] = None, _retry_from_search: bool = False) -> AnimeSeriesDetail:
+async def scrape_anime_series_detail(series_slug: str, client: AsyncClient, original_title: Optional[str] = None, _retry_from_search: bool = False, include_servers: bool = False) -> AnimeSeriesDetail:
     """
     Scrape detailed information about an anime series from toonstream.one/series/{series-slug}/
     
@@ -1513,57 +2220,97 @@ async def scrape_anime_series_detail(series_slug: str, client: AsyncClient, orig
             cast_text = cast_match.group(1).strip()
             cast = [c.strip() for c in re.split(r'[,]', cast_text) if c.strip() and len(c.strip()) > 2]
         
-        # Extract episodes
+        # Extract episodes - Enhanced automatic detection
         episodes = []
-        # Look for episode items - they usually have format like "1x1", "1x2", etc.
-        # Find all elements that might contain episode information
+        episode_urls_found = set()  # Track found URLs to avoid duplicates
+        
+        # Method 1: Look for episode items with class containing "episode"
         episode_items = soup.find_all(["div", "li", "article"], class_=lambda x: x and "episode" in " ".join(x).lower() if x else False)
         
+        # Method 2: Look for links with episode pattern in href
         if not episode_items:
-            # Fallback: look for h2 or h3 with episode format (e.g., "1x1", "1x2")
-            all_headings = soup.find_all(["h2", "h3"])
+            episode_links = soup.find_all("a", href=lambda x: x and ("episode" in x.lower() or re.search(r'\d+x\d+', x.lower())) if x else False)
+            for link in episode_links:
+                parent = link.find_parent(["div", "li", "article", "section"])
+                if parent and parent not in episode_items:
+                    episode_items.append(parent)
+        
+        # Method 3: Look for h2/h3/h4 with episode format (e.g., "1x1", "1x2", "S1E1")
+        if not episode_items:
+            all_headings = soup.find_all(["h2", "h3", "h4"])
             for heading in all_headings:
                 heading_text = heading.text.strip()
-                # Check if it matches episode format like "1x1" or contains "1x1" pattern
-                episode_pattern = re.search(r'(\d+)x(\d+)', heading_text)
+                # Check for various episode formats: "1x1", "S1E1", "Season 1 Episode 1", etc.
+                episode_pattern = re.search(r'(?:(\d+)[xX](\d+)|[Ss](\d+)[Ee](\d+)|Season\s*(\d+)\s*Episode\s*(\d+))', heading_text)
                 if episode_pattern:
                     # Find parent container
-                    parent = heading.find_parent(["div", "li", "article"])
-                    if parent:
+                    parent = heading.find_parent(["div", "li", "article", "section"])
+                    if parent and parent not in episode_items:
                         episode_items.append(parent)
         
-        # If still not found, try finding items with "View" link and episode pattern
+        # Method 4: Find items with "View" link and episode pattern
         if not episode_items:
-            view_links = soup.find_all("a", string=re.compile(r'View', re.IGNORECASE))
+            view_links = soup.find_all("a", string=re.compile(r'(View|Watch|Play)', re.IGNORECASE))
             for link in view_links:
                 # Check parent or nearby elements for episode pattern
                 parent = link.find_parent(["div", "li", "article", "section"])
                 if parent:
                     parent_text = parent.get_text()
-                    if re.search(r'\d+x\d+', parent_text):
+                    if re.search(r'\d+x\d+', parent_text) or re.search(r'[Ss]\d+[Ee]\d+', parent_text):
+                        if parent not in episode_items:
+                            episode_items.append(parent)
+        
+        # Method 5: Direct episode link search by URL pattern
+        if not episode_items:
+            all_links = soup.find_all("a", href=True)
+            for link in all_links:
+                href = link.get("href", "")
+                # Check if URL matches episode pattern: /episode/{series-slug}-{season}x{episode}/
+                if href and ("/episode/" in href.lower() or re.search(r'-\d+x\d+', href.lower())):
+                    parent = link.find_parent(["div", "li", "article", "section"])
+                    if parent and parent not in episode_items:
                         episode_items.append(parent)
         
-        # Parse episodes from found items
+        # Parse episodes from found items - Enhanced parsing
         for item in episode_items:
             try:
                 item_text = item.get_text()
-                episode_match = re.search(r'(\d+)x(\d+)', item_text)
+                
+                # Try multiple episode format patterns
+                episode_match = None
+                patterns = [
+                    r'(\d+)[xX](\d+)',  # 1x1, 1x2 format
+                    r'[Ss](\d+)[Ee](\d+)',  # S1E1 format
+                    r'Season\s*(\d+)\s*Episode\s*(\d+)',  # Season 1 Episode 1
+                    r'Ep\.?\s*(\d+)',  # Ep 1 (assume season 1)
+                ]
+                
+                for pattern in patterns:
+                    episode_match = re.search(pattern, item_text, re.IGNORECASE)
+                    if episode_match:
+                        break
+                
+                if not episode_match:
+                    # Try extracting from URL
+                    ep_link = item.find("a", href=True)
+                    if ep_link:
+                        href = ep_link.get("href", "")
+                        # Check URL pattern: /episode/{series-slug}-{season}x{episode}/
+                        url_match = re.search(r'-(\d+)x(\d+)', href)
+                        if url_match:
+                            episode_match = url_match
+                
                 if not episode_match:
                     continue
                 
-                season_num = episode_match.group(1)
-                episode_num = episode_match.group(2)
-                
-                # Extract episode title
-                ep_title_tag = item.find(["h2", "h3", "h4"]) or item.find("a")
-                ep_title = ep_title_tag.text.strip() if ep_title_tag and ep_title_tag.text.strip() else f"Episode {episode_num}"
-                # Remove episode number from title if present (e.g., "1x1", "1x2")
-                ep_title = re.sub(r'\d+x\d+\s*', '', ep_title).strip()
-                # If title is empty or just repeats series name, use default
-                if not ep_title or ep_title.lower() == title.lower():
-                    ep_title = f"Episode {episode_num}"
-                # Clean up title (remove extra whitespace, series name if it appears)
-                ep_title = re.sub(r'\s+', ' ', ep_title).strip()
+                # Extract season and episode numbers
+                if len(episode_match.groups()) >= 2:
+                    season_num = episode_match.group(1)
+                    episode_num = episode_match.group(2)
+                else:
+                    # Single group match (Ep 1 format)
+                    season_num = "1"
+                    episode_num = episode_match.group(1)
                 
                 # Extract episode URL
                 ep_url = None
@@ -1577,6 +2324,28 @@ async def scrape_anime_series_detail(series_slug: str, client: AsyncClient, orig
                             ep_url = base_url + ep_url
                         elif not ep_url.startswith(('http://', 'https://')):
                             ep_url = base_url + '/' + ep_url.lstrip('/')
+                
+                # Skip if URL already processed
+                if ep_url and ep_url in episode_urls_found:
+                    continue
+                if ep_url:
+                    episode_urls_found.add(ep_url)
+                
+                # Extract episode title
+                ep_title_tag = item.find(["h2", "h3", "h4"]) or item.find("a")
+                ep_title = ep_title_tag.text.strip() if ep_title_tag and ep_title_tag.text.strip() else f"Episode {episode_num}"
+                
+                # Remove episode number from title if present
+                ep_title = re.sub(r'\d+x\d+\s*', '', ep_title, flags=re.IGNORECASE).strip()
+                ep_title = re.sub(r'[Ss]\d+[Ee]\d+\s*', '', ep_title, flags=re.IGNORECASE).strip()
+                ep_title = re.sub(r'Season\s*\d+\s*Episode\s*\d+\s*', '', ep_title, flags=re.IGNORECASE).strip()
+                
+                # If title is empty or just repeats series name, use default
+                if not ep_title or ep_title.lower() == title.lower() or len(ep_title) < 3:
+                    ep_title = f"Episode {episode_num}"
+                
+                # Clean up title
+                ep_title = re.sub(r'\s+', ' ', ep_title).strip()
                 
                 # Extract episode image
                 ep_image_url = None
@@ -1593,9 +2362,16 @@ async def scrape_anime_series_detail(series_slug: str, client: AsyncClient, orig
                 
                 # Extract aired date if available
                 aired_date = None
-                date_match = re.search(r'(\d+\s*(?:months?|days?|weeks?)\s*ago)', item_text, re.IGNORECASE)
-                if date_match:
-                    aired_date = date_match.group(1).strip()
+                date_patterns = [
+                    r'(\d+\s*(?:months?|days?|weeks?|years?)\s*ago)',
+                    r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+                    r'(\d{4}-\d{2}-\d{2})',
+                ]
+                for date_pattern in date_patterns:
+                    date_match = re.search(date_pattern, item_text, re.IGNORECASE)
+                    if date_match:
+                        aired_date = date_match.group(1).strip()
+                        break
                 
                 if ep_url:  # Only add if we have a URL
                     episodes.append(AnimeEpisode(
@@ -1630,6 +2406,53 @@ async def scrape_anime_series_detail(series_slug: str, client: AsyncClient, orig
             cast=cast[:10] if cast else [],  # Limit to 10 cast members
             episodes=episodes
         )
+        
+        # Optionally populate server links for each episode
+        if include_servers and series_detail.episodes:
+            logger.info(f"Fetching server links for {len(series_detail.episodes)} anime episodes...")
+            
+            async def fetch_anime_episode_servers(ep: AnimeEpisode) -> AnimeEpisode:
+                """Fetch server links for a single anime episode"""
+                try:
+                    # Extract season and episode numbers
+                    season_num = int(ep.season)
+                    episode_num = int(ep.episode_number)
+                    
+                    # Fetch episode data to get server links
+                    episode_data = await scrape_anime_episode_detail(
+                        series_slug, 
+                        season_num, 
+                        episode_num, 
+                        client
+                    )
+                    
+                    # Update episode with server links
+                    return AnimeEpisode(
+                        title=ep.title,
+                        url=ep.url,
+                        season=ep.season,
+                        episode_number=ep.episode_number,
+                        image=ep.image,
+                        aired_date=ep.aired_date,
+                        servers=episode_data.servers
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to fetch servers for anime episode {ep.episode_number}: {e}")
+                    # Return original episode without servers
+                    return ep
+            
+            # Fetch all episodes concurrently (limit concurrency)
+            semaphore_episodes = asyncio.Semaphore(10)  # Limit concurrent episode fetches
+            
+            async def fetch_with_limit(ep: AnimeEpisode) -> AnimeEpisode:
+                async with semaphore_episodes:
+                    return await fetch_anime_episode_servers(ep)
+            
+            # Fetch all episodes
+            updated_episodes = await asyncio.gather(*[fetch_with_limit(ep) for ep in series_detail.episodes])
+            series_detail.episodes = updated_episodes
+            
+            logger.info(f"Successfully fetched server links for anime episodes")
         
         logger.info(f"Scraped series detail for '{title}': {len(episodes)} episodes found")
         return series_detail
@@ -1827,9 +2650,37 @@ async def scrape_anime_episode_detail(series_slug: str, season: int, episode: in
             episode_data['image'] = image_url
             
             # Extract streaming links - this is critical for deep scraping
-            streaming_links = []
+            streaming_links = []  # Legacy support
+            servers = []  # New structured server list
             
-            # Method 1: Look for iframe embeds (common for video players)
+            server_counter = 1
+            processed_urls = set()
+            
+            # Method 1: Look for server/player option links (most reliable for server names)
+            server_links = soup.find_all("a", class_=lambda x: x and ("server" in " ".join(x).lower() or "player" in " ".join(x).lower() or "option" in " ".join(x).lower()) if x else False)
+            for link in server_links:
+                href = link.get("href")
+                if href:
+                    if href.startswith("//"):
+                        href = "https:" + href
+                    elif href.startswith("/"):
+                        href = base_url + href
+                    elif not href.startswith(('http://', 'https://')):
+                        continue
+                    exclude_keywords = ['login', 'signup', 'advert', 'advertisement']
+                    if not any(exclude in href.lower() for exclude in exclude_keywords):
+                        if href not in processed_urls:
+                            processed_urls.add(href)
+                            streaming_links.append(href)  # Legacy
+                            servers.append(StreamingServer(
+                                name=extract_server_name(link, f"Server {server_counter}"),
+                                url=href,
+                                quality=extract_quality(link.text if hasattr(link, 'text') else "", href),
+                                type=get_server_type(href)
+                            ))
+                            server_counter += 1
+            
+            # Method 2: Look for iframe embeds (common for video players)
             iframes = soup.find_all("iframe")
             for iframe in iframes:
                 src = iframe.get("src") or iframe.get("data-src")
@@ -1843,10 +2694,18 @@ async def scrape_anime_episode_detail(series_slug: str, season: int, episode: in
                     # Filter out unwanted iframes
                     exclude_domains = ['facebook', 'twitter', 'instagram', 'google', 'ads', 'advertisement']
                     if not any(exclude in src.lower() for exclude in exclude_domains):
-                        if src not in streaming_links:
-                            streaming_links.append(src)
+                        if src not in processed_urls:
+                            processed_urls.add(src)
+                            streaming_links.append(src)  # Legacy
+                            servers.append(StreamingServer(
+                                name=f"Embed {server_counter}",
+                                url=src,
+                                quality=extract_quality("", src),
+                                type=get_server_type(src)
+                            ))
+                            server_counter += 1
             
-            # Method 2: Look for video player containers and their links
+            # Method 3: Look for video player containers and their links
             player_containers = soup.find_all(["div", "section"], class_=lambda x: x and ("player" in " ".join(x).lower() or "video" in " ".join(x).lower() or "embed" in " ".join(x).lower()) if x else False)
             for container in player_containers:
                 # Find all links in player container
@@ -1859,53 +2718,82 @@ async def scrape_anime_episode_detail(series_slug: str, season: int, episode: in
                         if any(keyword in link_text or keyword in href.lower() for keyword in ['watch', 'stream', 'play', 'server', 'embed', 'player']):
                             exclude_keywords = ['login', 'signup', 'advert', 'advertisement', 'facebook', 'twitter', 'instagram']
                             if not any(exclude in href.lower() for exclude in exclude_keywords):
-                                if href not in streaming_links:
-                                    streaming_links.append(href)
+                                if href not in processed_urls:
+                                    processed_urls.add(href)
+                                    streaming_links.append(href)  # Legacy
+                                    servers.append(StreamingServer(
+                                        name=extract_server_name(link, f"Server {server_counter}"),
+                                        url=href,
+                                        quality=extract_quality(link_text, href),
+                                        type=get_server_type(href)
+                                    ))
+                                    server_counter += 1
                 
                 # Also check for data attributes that might contain video URLs
                 for attr in ['data-src', 'data-url', 'data-video', 'data-embed']:
                     data_url = container.get(attr)
                     if data_url:
                         if data_url.startswith(('http://', 'https://')):
-                            if data_url not in streaming_links:
-                                streaming_links.append(data_url)
+                            if data_url not in processed_urls:
+                                processed_urls.add(data_url)
+                                streaming_links.append(data_url)  # Legacy
+                                servers.append(StreamingServer(
+                                    name=f"Data {server_counter}",
+                                    url=data_url,
+                                    quality=extract_quality("", data_url),
+                                    type=get_server_type(data_url)
+                                ))
+                                server_counter += 1
             
-            # Method 3: Look for server/player option links
-            server_links = soup.find_all("a", class_=lambda x: x and ("server" in " ".join(x).lower() or "player" in " ".join(x).lower() or "option" in " ".join(x).lower()) if x else False)
-            for link in server_links:
-                href = link.get("href")
-                if href:
-                    if href.startswith("//"):
-                        href = "https:" + href
-                    elif href.startswith("/"):
-                        href = base_url + href
-                    elif not href.startswith(('http://', 'https://')):
-                        continue
-                    exclude_keywords = ['login', 'signup', 'advert', 'advertisement']
-                    if not any(exclude in href.lower() for exclude in exclude_keywords):
-                        if href not in streaming_links:
-                            streaming_links.append(href)
-            
-            # Method 4: Look for embed/video links in script tags (some sites use JavaScript to load players)
+            # Method 4: Look for embed/video links in script tags (enhanced)
             script_tags = soup.find_all("script")
             for script in script_tags:
-                if script.string:
-                    # Look for URLs in script content
-                    url_patterns = [
-                        r'["\'](https?://[^"\']+embed[^"\']*)["\']',
-                        r'["\'](https?://[^"\']+player[^"\']*)["\']',
-                        r'["\'](https?://[^"\']+video[^"\']*)["\']',
-                        r'src["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
-                        r'url["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
-                    ]
-                    for pattern in url_patterns:
-                        matches = re.findall(pattern, script.string, re.IGNORECASE)
-                        for match in matches:
-                            if match.startswith(('http://', 'https://')):
-                                exclude_keywords = ['facebook', 'twitter', 'instagram', 'google', 'ads', 'analytics']
-                                if not any(exclude in match.lower() for exclude in exclude_keywords):
-                                    if match not in streaming_links:
-                                        streaming_links.append(match)
+                script_text = script.string or ""
+                if not script_text:
+                    continue
+                
+                # Enhanced URL patterns for video links
+                url_patterns = [
+                    r'["\'](https?://[^"\']*(?:embed|player|video|watch|stream|play|server|cdn|mp4|m3u8|webm|mkv|flv)[^"\']*)["\']',
+                    r'src["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'url["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'file["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'video["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'source["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'fileurl["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'video_url["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'videoUrl["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'getElementById\(["\']([^"\']+)["\']\)\.src\s*=\s*["\'](https?://[^"\']+)["\']',
+                    r'\.setAttribute\(["\']src["\'],\s*["\'](https?://[^"\']+)["\']',
+                    r'iframe\.src\s*=\s*["\'](https?://[^"\']+)["\']',
+                ]
+                
+                for pattern in url_patterns:
+                    matches = re.findall(pattern, script_text, re.IGNORECASE)
+                    for match in matches:
+                        # Handle tuple matches
+                        url = match[1] if isinstance(match, tuple) and len(match) > 1 else match
+                        if isinstance(match, tuple):
+                            url = match[1] if len(match) > 1 else match[0]
+                        else:
+                            url = match
+                        
+                        if url and url.startswith(('http://', 'https://')):
+                            exclude_keywords = ['facebook', 'twitter', 'instagram', 'google', 'ads', 'analytics', 'tracking', 'login', 'signup']
+                            if not any(exclude in url.lower() for exclude in exclude_keywords):
+                                # Check if it looks like a video URL
+                                video_indicators = ['stream', 'embed', 'player', 'watch', 'video', 'play', 'server', 'cdn', 'mp4', 'm3u8', 'webm', 'mkv', 'dood', 'streamtape', 'mixdrop', 'trembed']
+                                if any(indicator in url.lower() for indicator in video_indicators):
+                                    if url not in processed_urls:
+                                        processed_urls.add(url)
+                                        streaming_links.append(url)  # Legacy
+                                        servers.append(StreamingServer(
+                                            name=f"Script {server_counter}",
+                                            url=url,
+                                            quality=extract_quality("", url),
+                                            type=get_server_type(url)
+                                        ))
+                                        server_counter += 1
             
             # Method 5: Look for links with specific text patterns
             watch_links = soup.find_all("a", string=re.compile(r'(Watch|Stream|Play|Server|Embed)', re.IGNORECASE))
@@ -1920,8 +2808,16 @@ async def scrape_anime_episode_detail(series_slug: str, season: int, episode: in
                         continue
                     exclude_keywords = ['login', 'signup', 'advert', 'advertisement']
                     if not any(exclude in href.lower() for exclude in exclude_keywords):
-                        if href not in streaming_links:
-                            streaming_links.append(href)
+                        if href not in processed_urls:
+                            processed_urls.add(href)
+                            streaming_links.append(href)  # Legacy
+                            servers.append(StreamingServer(
+                                name=extract_server_name(link, f"Server {server_counter}"),
+                                url=href,
+                                quality=extract_quality(link.text if hasattr(link, 'text') else "", href),
+                                type=get_server_type(href)
+                            ))
+                            server_counter += 1
             
             # Method 6: Look for video source tags
             video_tags = soup.find_all("video")
@@ -1935,10 +2831,47 @@ async def scrape_anime_episode_detail(series_slug: str, season: int, episode: in
                         elif src.startswith("/"):
                             src = base_url + src
                         elif src.startswith(('http://', 'https://')):
-                            if src not in streaming_links:
-                                streaming_links.append(src)
+                            if src not in processed_urls:
+                                processed_urls.add(src)
+                                streaming_links.append(src)  # Legacy
+                                quality = source.get('label') or extract_quality("", src)
+                                servers.append(StreamingServer(
+                                    name=f"Direct {server_counter}",
+                                    url=src,
+                                    quality=quality,
+                                    type="direct"
+                                ))
+                                server_counter += 1
             
-            episode_data['streaming_links'] = streaming_links
+            episode_data['streaming_links'] = streaming_links  # Legacy support
+            episode_data['servers'] = servers  # New structured format
+            
+            # Deep resolve embed URLs to direct playable links
+            resolved_servers = []
+            for server in servers:
+                server_url_str = str(server.url)
+                if server.type in ['embed', 'iframe'] or '/embed/' in server_url_str.lower() or 'embed' in server_url_str.lower():
+                    # Try to resolve embed URL to direct link
+                    resolved_url = await resolve_embed_to_direct(client, server_url_str, max_depth=2)
+                    if resolved_url and resolved_url != server_url_str:
+                        # Use resolved URL if different
+                        resolved_servers.append(StreamingServer(
+                            name=server.name,
+                            url=resolved_url,
+                            quality=server.quality,
+                            type="direct" if resolved_url else server.type
+                        ))
+                    else:
+                        # Keep original if resolution failed or same
+                        resolved_servers.append(server)
+                else:
+                    # Keep non-embed links as-is
+                    resolved_servers.append(server)
+            
+            # Update episode data with resolved servers
+            episode_data['servers'] = resolved_servers
+            # Also update legacy streaming_links with resolved URLs
+            episode_data['streaming_links'] = [str(server.url) for server in resolved_servers]
             
             # Extract duration
             duration = None
@@ -2414,22 +3347,47 @@ async def scrape_toonstream_movie_detail(movie_slug: str, client: AsyncClient) -
                     val = container.get(attr)
                     if val: candidate_links.append(val)
 
-            # Method 4: Script processing for this page
+            # Method 4: Script processing for this page (enhanced)
             script_tags = soup.find_all("script")
             for script in script_tags:
-                if script.string:
-                    # Look for URLs in script content
-                    url_patterns = [
-                        r'["\'](https?://[^"\']+embed[^"\']*)["\']',
-                        r'["\'](https?://[^"\']+player[^"\']*)["\']',
-                         r'["\'](https?://[^"\']+video[^"\']*)["\']',
-                         r'src["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
-                         r'file["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
-                    ]
-                    for pattern in url_patterns:
-                        matches = re.findall(pattern, script.string, re.IGNORECASE)
-                        for match in matches:
-                            if match: candidate_links.append(match)
+                script_text = script.string or ""
+                if not script_text:
+                    continue
+                
+                # Enhanced URL patterns for video links
+                url_patterns = [
+                    r'["\'](https?://[^"\']*(?:embed|player|video|watch|stream|play|server|cdn|mp4|m3u8|webm|mkv|flv)[^"\']*)["\']',
+                    r'src["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'url["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'file["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'video["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'source["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'fileurl["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'video_url["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'videoUrl["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                    r'getElementById\(["\']([^"\']+)["\']\)\.src\s*=\s*["\'](https?://[^"\']+)["\']',
+                    r'\.setAttribute\(["\']src["\'],\s*["\'](https?://[^"\']+)["\']',
+                    r'iframe\.src\s*=\s*["\'](https?://[^"\']+)["\']',
+                ]
+                
+                for pattern in url_patterns:
+                    matches = re.findall(pattern, script_text, re.IGNORECASE)
+                    for match in matches:
+                        # Handle tuple matches
+                        url = match[1] if isinstance(match, tuple) and len(match) > 1 else match
+                        if isinstance(match, tuple):
+                            url = match[1] if len(match) > 1 else match[0]
+                        else:
+                            url = match
+                        
+                        if url and url.startswith(('http://', 'https://')):
+                            # Filter out non-video URLs
+                            exclude_keywords = ['facebook', 'twitter', 'instagram', 'google', 'ads', 'analytics', 'tracking', 'login', 'signup']
+                            if not any(exclude in url.lower() for exclude in exclude_keywords):
+                                # Check if it looks like a video URL
+                                video_indicators = ['stream', 'embed', 'player', 'watch', 'video', 'play', 'server', 'cdn', 'mp4', 'm3u8', 'webm', 'mkv', 'dood', 'streamtape', 'mixdrop', 'trembed']
+                                if any(indicator in url.lower() for indicator in video_indicators):
+                                    candidate_links.append(url)
 
             # Process candidates
             processed_candidates = set()
@@ -2449,16 +3407,15 @@ async def scrape_toonstream_movie_detail(movie_slug: str, client: AsyncClient) -
                 if any(exclude in href.lower() for exclude in exclude_keywords): continue
 
                 # Deep Resolution for internal embeds
-                if 'trembed=' in href  or '/embed/' in href:
-                    # Resolve this link
-                    resolved = await resolve_embed_url(href)
-                    if resolved:
-                        if resolved not in streaming_links:
-                            streaming_links.append(str(resolved)) # Explicit str conversion
-                        continue # If resolved, don't add the wrapper (unless checking if wrapper is useful?)
-                        # Actually, keeping the wrapper might be useful if resolution fails, but we want the video.
-                        # For now, let's prioritize resolved, but fallback to wrapper if needed.
-                        # If resolution worked, we have the better link.
+                resolved_url = None
+                if 'trembed=' in href or '/embed/' in href:
+                    # Resolve this link using the helper function
+                    resolved_url = await resolve_embed_to_direct(client, href, max_depth=2)
+                    if resolved_url:
+                        if resolved_url not in streaming_links:
+                            streaming_links.append(str(resolved_url))
+                        # Will add to servers list below
+                        href = resolved_url  # Use resolved URL for server creation
                 
                 # Add if it looks like a video/stream link
                 # Common domains or keywords
@@ -2471,13 +3428,65 @@ async def scrape_toonstream_movie_detail(movie_slug: str, client: AsyncClient) -
                      if href not in streaming_links:
                          streaming_links.append(str(href)) # Explicit str conversion
 
-            movie_data['streaming_links'] = streaming_links
+            # Create structured server objects from streaming links
+            servers = []
+            server_counter = 1
+            processed_urls = set()
+            
+            for href in streaming_links:
+                if href in processed_urls:
+                    continue
+                processed_urls.add(href)
+                
+                # Try to extract server name from URL or use default
+                server_name = f"Server {server_counter}"
+                # Check if we can extract from any watch links
+                for watch_link in watch_links:
+                    watch_href = watch_link.get("href")
+                    if watch_href and (watch_href == href or str(watch_href) == str(href)):
+                        server_name = extract_server_name(watch_link, server_name)
+                        break
+                
+                servers.append(StreamingServer(
+                    name=server_name,
+                    url=href,
+                    quality=extract_quality("", href),
+                    type=get_server_type(href)
+                ))
+                server_counter += 1
+            
+            # Deep resolve all embed URLs to direct playable links
+            resolved_servers = []
+            for server in servers:
+                server_url_str = str(server.url)
+                if server.type in ['embed', 'iframe'] or '/embed/' in server_url_str.lower() or 'embed' in server_url_str.lower() or 'trembed' in server_url_str.lower():
+                    # Try to resolve embed URL to direct link
+                    resolved_url = await resolve_embed_to_direct(client, server_url_str, max_depth=3)
+                    if resolved_url and resolved_url != server_url_str:
+                        # Use resolved URL if different
+                        resolved_servers.append(StreamingServer(
+                            name=server.name,
+                            url=resolved_url,
+                            quality=server.quality,
+                            type="direct" if resolved_url else server.type
+                        ))
+                    else:
+                        # Keep original if resolution failed or same
+                        resolved_servers.append(server)
+                else:
+                    # Keep non-embed links as-is
+                    resolved_servers.append(server)
+            
+            # Update movie data with resolved servers
+            movie_data['servers'] = resolved_servers
+            # Also update legacy streaming_links with resolved URLs
+            movie_data['streaming_links'] = [str(server.url) for server in resolved_servers]
             
             if not movie_data.get('title') or not movie_data.get('url'):
                 logger.warning(f"Failed to parse movie data for {movie_slug}")
                 raise HTTPException(status_code=404, detail=f"Movie not found: {movie_slug}")
             
-            logger.info(f"Scraped movie detail for '{title}': {len(streaming_links)} streaming links found")
+            logger.info(f"Scraped movie detail for '{title}': {len(resolved_servers)} streaming links found (all resolved to direct playable URLs)")
             return ToonstreamMovieDetail(**movie_data)
             
         except HTTPStatusError as e:
