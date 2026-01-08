@@ -2,6 +2,16 @@
 from pydantic import BaseModel, HttpUrl, Field
 from typing import List, Optional
 
+class StreamingServer(BaseModel):
+    """Model for streaming server information with metadata"""
+    name: str = Field(..., description="Server name (e.g., 'Server 1', 'HD Server', 'DoodStream')")
+    url: HttpUrl = Field(..., description="Direct playable URL or embed URL")
+    quality: Optional[str] = Field(None, description="Video quality (e.g., '720p', '1080p', 'HD')")
+    type: Optional[str] = Field(None, description="Server type (e.g., 'embed', 'direct', 'iframe')")
+    
+    class Config:
+        from_attributes = True
+
 class Movie(BaseModel):
     title: str = Field(..., description="Movie title")
     url: HttpUrl = Field(..., description="Movie page URL")
@@ -42,7 +52,8 @@ class Episode(BaseModel):
     episode_number: str = Field(..., description="Episode number")
     description: Optional[str] = Field(default=None, description="Episode description")
     image: Optional[HttpUrl] = Field(default=None, description="Episode thumbnail URL")
-    streaming_links: List[HttpUrl] = Field(default_factory=list, description="Streaming or download links")
+    streaming_links: List[HttpUrl] = Field(default_factory=list, description="Streaming or download links (legacy)")
+    servers: List[StreamingServer] = Field(default_factory=list, description="Structured server links with metadata for frontend")
     duration: Optional[str] = Field(default=None, description="Episode duration")
     language: Optional[str] = Field(default=None, description="Language of the episode")
 
@@ -69,6 +80,7 @@ class AnimeEpisode(BaseModel):
     episode_number: str = Field(..., description="Episode number")
     image: Optional[HttpUrl] = Field(None, description="Episode thumbnail URL")
     aired_date: Optional[str] = Field(None, description="Episode aired date")
+    servers: List[StreamingServer] = Field(default_factory=list, description="Structured server links with metadata for frontend")
 
     class Config:
         from_attributes = True
@@ -105,7 +117,8 @@ class ToonstreamMovieDetail(BaseModel):
     duration: Optional[str] = Field(None, description="Movie duration")
     director: Optional[str] = Field(None, description="Director name")
     cast: List[str] = Field(default_factory=list, description="List of cast members")
-    streaming_links: List[HttpUrl] = Field(default_factory=list, description="Streaming or download links from multiple servers")
+    streaming_links: List[HttpUrl] = Field(default_factory=list, description="Streaming or download links from multiple servers (legacy)")
+    servers: List[StreamingServer] = Field(default_factory=list, description="Structured server links with metadata for frontend")
 
     class Config:
         from_attributes = True
@@ -118,6 +131,7 @@ class SeriesEpisode(BaseModel):
     image: Optional[HttpUrl] = Field(None, description="Episode thumbnail URL")
     duration: Optional[str] = Field(None, description="Episode duration")
     language: Optional[str] = Field(None, description="Language of the episode")
+    servers: List[StreamingServer] = Field(default_factory=list, description="Structured server links with metadata for frontend")
 
     class Config:
         from_attributes = True
@@ -154,7 +168,29 @@ class MovieDetail(BaseModel):
     duration: Optional[str] = Field(None, description="Movie duration")
     director: Optional[str] = Field(None, description="Director name")
     cast: List[str] = Field(default_factory=list, description="List of cast members")
-    streaming_links: List[HttpUrl] = Field(default_factory=list, description="Streaming or download links from multiple servers")
+    streaming_links: List[HttpUrl] = Field(default_factory=list, description="Streaming or download links from multiple servers (legacy)")
+    servers: List[StreamingServer] = Field(default_factory=list, description="Structured server links with metadata for frontend")
+
+    class Config:
+        from_attributes = True
+
+class EpisodeRequest(BaseModel):
+    """Model for batch episode server link requests"""
+    series_slug: str = Field(..., description="Series slug identifier")
+    season: int = Field(..., ge=1, description="Season number")
+    episode: int = Field(..., ge=1, description="Episode number")
+    language: Optional[str] = Field(None, description="Optional language filter")
+
+    class Config:
+        from_attributes = True
+
+class EpisodeServerResponse(BaseModel):
+    """Model for batch episode server link response"""
+    series_slug: str = Field(..., description="Series slug identifier")
+    season: int = Field(..., description="Season number")
+    episode: int = Field(..., description="Episode number")
+    servers: List[StreamingServer] = Field(default_factory=list, description="Structured server links")
+    error: Optional[str] = Field(None, description="Error message if fetching failed")
 
     class Config:
         from_attributes = True
