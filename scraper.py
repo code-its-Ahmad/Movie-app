@@ -27,46 +27,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Base URLs for scraping
-HINDILINKS_BASE_URL = "https://hindilinks4u.host"
+# Note: hindilinks4u.host redirects to hindilinks4u.delivery
+HINDILINKS_BASE_URL = "https://hindilinks4u.delivery"
+HINDILINKS_OLD_BASE_URL = "https://hindilinks4u.host"  # For fallback
 TOONSTREAM_BASE_URL = "https://toonstream.one"
-
-# Cache for actual base URL after redirects
-_actual_hindilinks_base_url = None
-
-async def get_actual_hindilinks_base_url(client: AsyncClient) -> str:
-    """Get the actual base URL after following redirects (hindilinks4u.host -> hindilinks4u.delivery)"""
-    global _actual_hindilinks_base_url
-    
-    if _actual_hindilinks_base_url:
-        return _actual_hindilinks_base_url
-    
-    try:
-        # Make a test request to detect the actual domain
-        response = await client.get(HINDILINKS_BASE_URL, follow_redirects=True, timeout=15.0)
-        actual_url = str(response.url)
-        # Extract base URL (protocol + domain)
-        from urllib.parse import urlparse
-        parsed = urlparse(actual_url)
-        _actual_hindilinks_base_url = f"{parsed.scheme}://{parsed.netloc}"
-        logger.info(f"Detected actual hindilinks base URL: {_actual_hindilinks_base_url}")
-        return _actual_hindilinks_base_url
-    except Exception as e:
-        logger.warning(f"Failed to detect actual base URL, using default: {e}")
-        # Try common redirect domains
-        for domain in ["hindilinks4u.delivery", "hindilinks4u.host", "hindilinks4u.net"]:
-            try:
-                test_url = f"https://{domain}"
-                test_response = await client.get(test_url, follow_redirects=True, timeout=10.0)
-                if test_response.status_code == 200:
-                    parsed = urlparse(str(test_response.url))
-                    _actual_hindilinks_base_url = f"{parsed.scheme}://{parsed.netloc}"
-                    logger.info(f"Detected actual hindilinks base URL via fallback: {_actual_hindilinks_base_url}")
-                    return _actual_hindilinks_base_url
-            except:
-                continue
-        # Fallback to original
-        _actual_hindilinks_base_url = HINDILINKS_BASE_URL
-        return _actual_hindilinks_base_url
 
 # Helper function to extract series slug from URL
 def extract_series_slug_from_url(url: str) -> Optional[str]:
@@ -749,16 +713,9 @@ async def scrape_page(url: str, client: AsyncClient, logger, semaphore: asyncio.
                         if next_url.startswith('//'):
                             next_url = 'https:' + next_url
                         elif next_url.startswith('/'):
-                            # Extract base URL from current request URL
-                            from urllib.parse import urlparse
-                            parsed = urlparse(url)
-                            base_url_ctx = f"{parsed.scheme}://{parsed.netloc}"
-                            next_url = base_url_ctx + next_url
+                            next_url = HINDILINKS_BASE_URL + next_url
                         elif not next_url.startswith(('http://', 'https://')):
-                            from urllib.parse import urlparse
-                            parsed = urlparse(url)
-                            base_url_ctx = f"{parsed.scheme}://{parsed.netloc}"
-                            next_url = base_url_ctx + '/' + next_url.lstrip('/')
+                            next_url = HINDILINKS_BASE_URL + '/' + next_url.lstrip('/')
             
             logger.debug(f"Scraped {len(items)} items from {url}, next_url: {next_url}")
             return items, next_url
@@ -780,9 +737,8 @@ async def scrape_page(url: str, client: AsyncClient, logger, semaphore: asyncio.
 
 # Function to scrape movies by search term
 async def scrape_movie_data(search_term: str, client: AsyncClient, language: Optional[str] = None, max_pages: int = 3) -> List[Movie]:
-    base_url = await get_actual_hindilinks_base_url(client)
     formatted_search_term = quote(search_term)
-    url = f"{base_url}/?s={formatted_search_term}"
+    url = f"{HINDILINKS_BASE_URL}/?s={formatted_search_term}"
     semaphore = asyncio.Semaphore(5)
     
     logger.info(f"Scraping movie search URL: {url}")
@@ -827,8 +783,7 @@ async def scrape_movies_by_year_page(year: int, page: int, client: AsyncClient) 
     if page < 1:
         raise HTTPException(status_code=400, detail="Page must be a positive integer")
     
-    base_url = await get_actual_hindilinks_base_url(client)
-    url = f"{base_url}/release-year/{year}/" if page == 1 else f"{base_url}/release-year/{year}/page/{page}/"
+    url = f"{HINDILINKS_BASE_URL}/release-year/{year}/" if page == 1 else f"{HINDILINKS_BASE_URL}/release-year/{year}/page/{page}/"
     semaphore = asyncio.Semaphore(5)
     
     movies, _ = await scrape_page(url, client, logger, semaphore, Movie)
@@ -842,8 +797,7 @@ async def scrape_movies_by_genre_page(genre: str, page: int, client: AsyncClient
     if page < 1:
         raise HTTPException(status_code=400, detail="Page must be a positive integer")
     
-    base_url = await get_actual_hindilinks_base_url(client)
-    url = f"{base_url}/genre/{genre}/" if page == 1 else f"{base_url}/genre/{genre}/page/{page}/"
+    url = f"{HINDILINKS_BASE_URL}/genre/{genre}/" if page == 1 else f"{HINDILINKS_BASE_URL}/genre/{genre}/page/{page}/"
     semaphore = asyncio.Semaphore(5)
     
     movies, _ = await scrape_page(url, client, logger, semaphore, Movie)
@@ -857,8 +811,7 @@ async def scrape_movies_by_director_page(director: str, page: int, client: Async
     if page < 1:
         raise HTTPException(status_code=400, detail="Page must be a positive integer")
     
-    base_url = await get_actual_hindilinks_base_url(client)
-    url = f"{base_url}/director/{director}/" if page == 1 else f"{base_url}/director/{director}/page/{page}/"
+    url = f"{HINDILINKS_BASE_URL}/director/{director}/" if page == 1 else f"{HINDILINKS_BASE_URL}/director/{director}/page/{page}/"
     semaphore = asyncio.Semaphore(5)
     
     movies, _ = await scrape_page(url, client, logger, semaphore, Movie)
@@ -872,8 +825,7 @@ async def scrape_series_page(page: int, client: AsyncClient) -> List[Series]:
     if page < 1:
         raise HTTPException(status_code=400, detail="Page must be a positive integer")
     
-    base_url = await get_actual_hindilinks_base_url(client)
-    url = f"{base_url}/series/" if page == 1 else f"{base_url}/series/page/{page}/"
+    url = f"{HINDILINKS_BASE_URL}/series/" if page == 1 else f"{HINDILINKS_BASE_URL}/series/page/{page}/"
     semaphore = asyncio.Semaphore(5)
     
     series, _ = await scrape_page(url, client, logger, semaphore, Series)
@@ -886,9 +838,8 @@ async def scrape_series_search(search_series: str, client: AsyncClient) -> List[
     if not search_series.strip():
         raise HTTPException(status_code=400, detail="Search query cannot be empty")
     
-    base_url = await get_actual_hindilinks_base_url(client)
     formatted_search_term = quote(search_series)
-    url = f"{base_url}/series/?s={formatted_search_term}"
+    url = f"{HINDILINKS_BASE_URL}/series/?s={formatted_search_term}"
     semaphore = asyncio.Semaphore(5)
     
     series, _ = await scrape_page(url, client, logger, semaphore, Series)
@@ -898,17 +849,18 @@ async def scrape_series_search(search_series: str, client: AsyncClient) -> List[
     return series
 
 # Helper function to parse episode data
-def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, episode: int, base_url: str = None) -> Episode:
+def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, episode: int) -> Episode:
     episode_data = {}
-    
-    # Use provided base_url or fallback to default
-    if base_url is None:
-        base_url = HINDILINKS_BASE_URL
 
     title_tag = soup.find('h1', class_='entry-title') or soup.find('h1')
     episode_data['title'] = title_tag.text.strip() if title_tag else f"{series_slug.replace('-', ' ').title()} S{season:02d}E{episode:02d}"
 
-    episode_data['url'] = f"{base_url}/episode/{series_slug}-season-{season}-episode-{episode}/"
+    # Use the actual URL from the page if available, otherwise construct it
+    current_url_tag = soup.find('link', rel='canonical') or soup.find('meta', property='og:url')
+    if current_url_tag:
+        episode_data['url'] = current_url_tag.get('href') or current_url_tag.get('content')
+    else:
+        episode_data['url'] = f"{HINDILINKS_BASE_URL}/episode/{series_slug}-season-{season}-episode-{episode}/"
 
     episode_data['series_title'] = series_slug.replace('-', ' ').title()
     series_title_tag = soup.find('a', href=lambda x: x and '/series/' in x)
@@ -930,20 +882,23 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
             if image_url.startswith('//'):
                 image_url = 'https:' + image_url
             elif image_url.startswith('/'):
-                image_url = base_url + image_url
+                image_url = HINDILINKS_BASE_URL + image_url
             elif not image_url.startswith(('http://', 'https://')):
-                image_url = base_url + '/' + image_url.lstrip('/')
+                image_url = HINDILINKS_BASE_URL + '/' + image_url.lstrip('/')
     episode_data['image'] = image_url
 
     streaming_links = []  # Legacy support
     servers = []  # New structured server list
     
     # Comprehensive video server extraction with metadata
+    # Enhanced for new hindilinks4u.delivery structure with "Server 1", "Server 2" format
     # 1. Look for server selection buttons/links (most reliable for server names)
     server_selectors = [
-        ('a', {'class': lambda x: x and ('server' in " ".join(x).lower() or 'link' in " ".join(x).lower() or 'watch' in " ".join(x).lower()) if x else False}),
+        # New format: Look for elements with "Server 1", "Server 2" text
+        ('div', {'class': lambda x: x and ('server' in " ".join(x).lower() if x else False)}),
+        ('a', {'class': lambda x: x and ('server' in " ".join(x).lower() or 'link' in " ".join(x).lower() or 'watch' in " ".join(x).lower() or 'download' in " ".join(x).lower()) if x else False}),
         ('button', {'class': lambda x: x and ('server' in " ".join(x).lower() or 'play' in " ".join(x).lower()) if x else False}),
-        ('div', {'class': lambda x: x and ('server' in " ".join(x).lower() or 'player-option' in " ".join(x).lower()) if x else False}),
+        ('div', {'class': lambda x: x and ('player-option' in " ".join(x).lower()) if x else False}),
         ('a', {'class': 'link'}),
         ('a', {'class': 'watch-link'}),
         ('a', {'class': 'stream-link'}),
@@ -953,6 +908,51 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
     server_counter = 1
     processed_urls = set()
     
+    # Enhanced: Look for server structure in new format
+    # Pattern: "Server 1" / "Server 2" with quality info (HD 1080p, HD 720p)
+    server_sections = soup.find_all(['div', 'section', 'article'], class_=lambda x: x and ('server' in " ".join(x).lower() if x else False))
+    for section in server_sections:
+        # Look for server number/name
+        section_text = section.get_text()
+        server_match = re.search(r'Server\s*(\d+)', section_text, re.IGNORECASE)
+        server_name = f"Server {server_match.group(1)}" if server_match else f"Server {server_counter}"
+        
+        # Look for quality info
+        quality_match = re.search(r'(HD|SD|FHD|UHD|4K)?\s*(\d+p|720p|1080p|480p|360p)', section_text, re.IGNORECASE)
+        quality = quality_match.group(0).strip() if quality_match else None
+        
+        # Find download/watch links in this section
+        section_links = section.find_all('a', href=True)
+        for link in section_links:
+            href = link.get('href')
+            link_text = link.get_text().strip().lower()
+            
+            # Check if it's a download/watch link
+            if href and any(keyword in link_text for keyword in ['download', 'watch', 'stream', 'play', 'hd', '720p', '1080p']):
+                if href.startswith('//'):
+                    href = 'https:' + href
+                elif href.startswith('/'):
+                    href = HINDILINKS_BASE_URL + href
+                elif not href.startswith(('http://', 'https://')):
+                    continue
+                
+                # Filter out unwanted links
+                exclude_keywords = ['login', 'signup', 'advert', 'advertisement', 'facebook', 'twitter', 'instagram']
+                if any(exclude in href.lower() for exclude in exclude_keywords):
+                    continue
+                
+                if href not in processed_urls:
+                    processed_urls.add(href)
+                    streaming_links.append(href)
+                    servers.append(StreamingServer(
+                        name=server_name,
+                        url=href,
+                        quality=quality or extract_quality(link_text, href),
+                        type=get_server_type(href)
+                    ))
+                    server_counter += 1
+    
+    # Original method: Look through selectors
     for tag_name, attrs in server_selectors:
         link_tags = soup.find_all(tag_name, attrs)
         if link_tags:
@@ -965,7 +965,7 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
                     if href.startswith('//'):
                         href = 'https:' + href
                     elif href.startswith('/'):
-                        href = base_url + href
+                        href = HINDILINKS_BASE_URL + href
                     elif not href.startswith(('http://', 'https://')):
                         continue
                     
@@ -1149,7 +1149,7 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
                 if data_url.startswith('//'):
                     data_url = 'https:' + data_url
                 elif data_url.startswith('/'):
-                    data_url = base_url + data_url
+                    data_url = HINDILINKS_BASE_URL + data_url
                 elif data_url.startswith(('http://', 'https://')):
                     if data_url not in processed_urls:
                         processed_urls.add(data_url)
@@ -1170,7 +1170,7 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
                 if href.startswith('//'):
                     href = 'https:' + href
                 elif href.startswith('/'):
-                    href = base_url + href
+                    href = HINDILINKS_BASE_URL + href
                 elif href.startswith(('http://', 'https://')):
                     if href not in processed_urls:
                         processed_urls.add(href)
@@ -1193,7 +1193,7 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
                 if href.startswith('//'):
                     href = 'https:' + href
                 elif href.startswith('/'):
-                    href = base_url + href
+                    href = HINDILINKS_BASE_URL + href
                 elif not href.startswith(('http://', 'https://')):
                     continue
                     
@@ -1257,20 +1257,77 @@ async def scrape_episode_data(
     if season < 1 or episode < 1:
         raise HTTPException(status_code=400, detail="Season and episode must be positive integers")
 
-    # Get actual base URL after redirects
-    actual_base_url = await get_actual_hindilinks_base_url(client)
-    url = f"{actual_base_url}/episode/{series_slug}-season-{season}-episode-{episode}/"
+    # Try multiple URL patterns for the new domain structure
+    # Pattern 1: Standard format: /episode/{series}-season-{s}-episode-{e}/
+    # Pattern 2: New format with part: /{series}-{year}-season-{s}-part-{e}-{lang}-dubbed-Watch-online-full-movie/
+    # Pattern 3: New format episode: /{series}-{year}-season-{s}-episode-{e}-{lang}-dubbed-Watch-online-full-movie/
+    
+    url_patterns = [
+        f"{HINDILINKS_BASE_URL}/episode/{series_slug}-season-{season}-episode-{episode}/",
+        f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-episode-{episode}/",
+        f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-part-{episode}-hindi-dubbed-Watch-online-full-movie/",
+        f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-episode-{episode}-hindi-dubbed-Watch-online-full-movie/",
+    ]
+    
+    # Add language-specific patterns if language is provided
+    if language:
+        lang_slug = language.lower()
+        url_patterns.extend([
+            f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-part-{episode}-{lang_slug}-dubbed-Watch-online-full-movie/",
+            f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-episode-{episode}-{lang_slug}-dubbed-Watch-online-full-movie/",
+        ])
+    
     semaphore = asyncio.Semaphore(5)
+    last_error = None
 
     async with semaphore:
-        logger.info(f"Scraping episode URL: {url}")
-        await asyncio.sleep(1)
+        for url in url_patterns:
+            try:
+                logger.info(f"Trying episode URL: {url}")
+                await asyncio.sleep(1)
+                response = await client.get(url, follow_redirects=True)
+                
+                # Check if we got redirected to a different domain
+                final_url = str(response.url)
+                if 'hindilinks4u.delivery' in final_url and 'hindilinks4u.host' in url:
+                    # Update base URL if we got redirected
+                    logger.info(f"Detected redirect to new domain: {final_url}")
+                
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    # Check if page actually has content (not a 404 page)
+                    title_tag = soup.find('h1') or soup.find('title')
+                    if title_tag and '404' not in title_tag.text.lower() and 'not found' not in title_tag.text.lower():
+                        episode_data = parse_episode(soup, logger, series_slug, season, episode)
+                        break
+                elif response.status_code == 404:
+                    continue  # Try next pattern
+                else:
+                    response.raise_for_status()
+            except HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    last_error = e
+                    continue  # Try next pattern
+                last_error = e
+            except Exception as e:
+                last_error = e
+                continue
+        
+        # If we got here without breaking, all patterns failed
+        if 'episode_data' not in locals():
+            if last_error:
+                if isinstance(last_error, HTTPStatusError) and last_error.response.status_code == 404:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Episode not found for {series_slug} season {season} episode {episode}"
+                    )
+                raise HTTPException(status_code=502, detail=f"Failed to fetch data: {str(last_error)}")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Episode not found for {series_slug} season {season} episode {episode}"
+            )
+        
         try:
-            response = await client.get(url)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-            # Pass actual base URL to parse_episode
-            episode_data = parse_episode(soup, logger, series_slug, season, episode, base_url=actual_base_url)
 
             # Deep resolve embed URLs to direct playable links
             resolved_servers = []
@@ -1331,17 +1388,13 @@ async def scrape_episode_data(
             raise HTTPException(status_code=500, detail=f"Scraping error: {str(e)}")
 
 # Helper function to parse series detail
-def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_title: Optional[str] = None, base_url: str = None) -> SeriesDetail:
+def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_title: Optional[str] = None) -> SeriesDetail:
     # 1. Metadata extraction
-    # Use provided base_url or fallback to default
-    if base_url is None:
-        base_url = HINDILINKS_BASE_URL
-        
     title_tag = soup.find('h1', class_='entry-title') or soup.find('h1')
     title = title_tag.text.strip() if title_tag else (original_title or series_slug.replace('-', ' ').title())
     
     # Extract ID from body class if available (for data-id usage generally, but mainly url here)
-    url = f"{base_url}/series/{series_slug}/"
+    url = f"{HINDILINKS_BASE_URL}/series/{series_slug}/"
     
     desc_tag = soup.find('div', class_='entry-content') or soup.find('div', class_='description') or soup.find('p', class_='f-desc')
     description = desc_tag.text.strip() if desc_tag else None
@@ -1354,9 +1407,9 @@ def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_
             if image_url.startswith('//'):
                 image_url = 'https:' + image_url
             elif image_url.startswith('/'):
-                image_url = base_url + image_url
+                image_url = HINDILINKS_BASE_URL + image_url
             elif not image_url.startswith(('http://', 'https://')):
-                image_url = base_url + '/' + image_url.lstrip('/')
+                image_url = HINDILINKS_BASE_URL + '/' + image_url.lstrip('/')
     
     # Extra info
     extra_info = soup.find('div', class_='sheader') or soup.find('div', class_='extra')
@@ -1462,9 +1515,9 @@ def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_
             if ep_url.startswith('//'):
                 ep_url = 'https:' + ep_url
             elif ep_url.startswith('/'):
-                ep_url = base_url + ep_url
+                ep_url = HINDILINKS_BASE_URL + ep_url
             elif not ep_url.startswith(('http://', 'https://')):
-                ep_url = base_url + '/' + ep_url.lstrip('/')
+                ep_url = HINDILINKS_BASE_URL + '/' + ep_url.lstrip('/')
             
             # Extract episode title
             ep_title = ep_link.text.strip() if hasattr(ep_link, 'text') else (ep.text.strip() if hasattr(ep, 'text') else f"Episode {season_episode_map[season_num] + 1}")
@@ -1516,9 +1569,9 @@ def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_
                     if ep_image_url.startswith('//'):
                         ep_image_url = 'https:' + ep_image_url
                     elif ep_image_url.startswith('/'):
-                        ep_image_url = base_url + ep_image_url
+                        ep_image_url = HINDILINKS_BASE_URL + ep_image_url
                     elif not ep_image_url.startswith(('http://', 'https://')):
-                        ep_image_url = base_url + '/' + ep_image_url.lstrip('/')
+                        ep_image_url = HINDILINKS_BASE_URL + '/' + ep_image_url.lstrip('/')
             
             total_episodes_count += 1
             episodes.append(SeriesEpisode(
@@ -1546,9 +1599,9 @@ def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_
             if ep_url.startswith('//'):
                 ep_url = 'https:' + ep_url
             elif ep_url.startswith('/'):
-                ep_url = base_url + ep_url
+                ep_url = HINDILINKS_BASE_URL + ep_url
             elif not ep_url.startswith(('http://', 'https://')):
-                ep_url = base_url + '/' + ep_url.lstrip('/')
+                ep_url = HINDILINKS_BASE_URL + '/' + ep_url.lstrip('/')
             
             # Extract season and episode from URL
             season_match = re.search(r'season-(\d+)', ep_url, re.IGNORECASE)
@@ -1570,7 +1623,7 @@ def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_
                             if ep_image_url.startswith('//'):
                                 ep_image_url = 'https:' + ep_image_url
                             elif ep_image_url.startswith('/'):
-                                ep_image_url = base_url + ep_image_url
+                                ep_image_url = HINDILINKS_BASE_URL + ep_image_url
                 
                 episodes.append(SeriesEpisode(
                     title=ep_title,
@@ -1629,9 +1682,7 @@ async def scrape_series_detail(series_slug: str, client: AsyncClient, include_se
     Returns:
         SeriesDetail object with episode information
     """
-    # Get actual base URL after redirects
-    actual_base_url = await get_actual_hindilinks_base_url(client)
-    url = f"{actual_base_url}/series/{series_slug}/"
+    url = f"{HINDILINKS_BASE_URL}/series/{series_slug}/"
     semaphore = asyncio.Semaphore(5)
     
     async with semaphore:
@@ -1641,8 +1692,7 @@ async def scrape_series_detail(series_slug: str, client: AsyncClient, include_se
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Pass actual base URL to parse_series_detail
-            series_detail = parse_series_detail(soup, logger, series_slug, base_url=actual_base_url)
+            series_detail = parse_series_detail(soup, logger, series_slug)
             
             # Optionally populate server links for each episode
             if include_servers and series_detail.episodes:
