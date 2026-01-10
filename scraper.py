@@ -27,9 +27,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Base URLs for scraping
-# Note: hindilinks4u.host redirects to hindilinks4u.delivery
-HINDILINKS_BASE_URL = "https://hindilinks4u.delivery"
-HINDILINKS_OLD_BASE_URL = "https://hindilinks4u.host"  # For fallback
+# Primary domain: hindilinks4u.host
+HINDILINKS_BASE_URL = "https://hindilinks4u.host"
+HINDILINKS_OLD_BASE_URL = "https://hindilinks4u.delivery"  # For fallback
 TOONSTREAM_BASE_URL = "https://toonstream.one"
 
 # Helper function to extract series slug from URL
@@ -339,6 +339,242 @@ async def resolve_embed_to_direct(client: AsyncClient, embed_url: str, max_depth
                                 return src
             except Exception as e:
                 logger.debug(f"Vidstream/Vidcloud resolution attempt failed: {e}")
+        
+        # Speedostream1.com pattern (common video hosting) - Enhanced deep resolution
+        if 'speedostream1.com' in embed_url_lower or 'speedostream' in embed_url_lower:
+            try:
+                logger.debug(f"Attempting speedostream resolution for: {embed_url[:80]}...")
+                # Set headers to mimic browser
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Referer': embed_url,
+                }
+                
+                # Method 0: Check if URL is already a direct video link (speedostream direct links)
+                # Speedostream URLs like https://speedostream1.com/ikzywb8xwwyf might be direct playable
+                # These are short codes that might be direct video endpoints
+                if any(ext in embed_url_lower for ext in ['.mp4', '.m3u8', '.webm', '.mkv', '.flv']):
+                    # Check if it's actually accessible
+                    try:
+                        head_response = await client.head(embed_url, timeout=10.0, headers=headers)
+                        content_type = head_response.headers.get('content-type', '').lower()
+                        if 'video' in content_type or 'stream' in content_type:
+                            logger.debug(f"Speedostream URL is already direct video: {embed_url[:80]}...")
+                            return embed_url
+                    except Exception:
+                        pass
+                
+                # Method 0.5: Check if it's a short code URL (like /ikzywb8xwwyf) - might be direct playable
+                # Pattern: https://speedostream1.com/{short_code} - these might be direct video endpoints
+                speedo_match = re.match(r'https?://[^/]*speedostream[^/]*/([^/?]+)/?$', embed_url_lower)
+                if speedo_match:
+                    short_code = speedo_match.group(1)
+                    # If it's a short alphanumeric code (not a path like /embed/ or /video/), try as direct
+                    if re.match(r'^[a-z0-9]+$', short_code) and len(short_code) >= 8:
+                        try:
+                            # Try HEAD request to check if it's a video
+                            head_response = await client.head(embed_url, timeout=10.0, headers=headers, follow_redirects=True)
+                            content_type = head_response.headers.get('content-type', '').lower()
+                            final_url = str(head_response.url)
+                            # If it redirects to a video file or has video content type, it's direct
+                            if ('video' in content_type or 'stream' in content_type or 
+                                any(ext in final_url.lower() for ext in ['.mp4', '.m3u8', '.webm', '.mkv', '.flv'])):
+                                logger.debug(f"Speedostream short code is direct playable: {embed_url[:80]}...")
+                                return final_url if final_url != embed_url else embed_url
+                        except Exception:
+                            pass
+                
+                # For speedostream URLs without extensions, try to fetch and check if it's a player page
+                # or if it redirects to a direct video URL
+                response = await client.get(embed_url, follow_redirects=True, timeout=30.0, headers=headers)
+                
+                # Check if final URL after redirects is a direct video
+                final_url = str(response.url)
+                final_url_lower = final_url.lower()
+                if any(ext in final_url_lower for ext in ['.mp4', '.m3u8', '.webm', '.mkv', '.flv']):
+                    logger.debug(f"Speedostream redirected to direct video: {final_url[:80]}...")
+                    return final_url
+                
+                if response.status_code == 200:
+                    text = response.text
+                    soup_temp = BeautifulSoup(text, 'html.parser')
+                    
+                    # Method 1: Look for direct video source in script tags (comprehensive patterns)
+                    scripts = soup_temp.find_all('script')
+                    for script in scripts:
+                        script_text = script.string or ""
+                        if not script_text:
+                            continue
+                        
+                        # Enhanced patterns for speedostream and general video URLs
+                        patterns = [
+                            # Direct speedostream video URLs (highest priority)
+                            r'["\'](https?://[^"\']*speedostream[^"\']*\.(?:mp4|m3u8|webm|mkv|flv)[^"\']*)["\']',
+                            r'["\'](https?://[^"\']*speedostream[^"\']*/(?:v|video|file|stream|play|embed|e)[^"\']*)["\']',
+                            # Speedostream specific patterns
+                            r'speedostream["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                            r'player["\']?\s*[:=]\s*["\'](https?://[^"\']*speedostream[^"\']+)["\']',
+                            # Variable assignments (comprehensive)
+                            r'(?:src|file|url|source|video_url|videoUrl|stream_url|streamUrl|videoSrc|video_src)["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                            r'(?:src|file|url|source)["\']?\s*=\s*["\'](https?://[^"\']+)["\']',
+                            # Array/object patterns
+                            r'sources["\']?\s*[:=]\s*\[["\'](https?://[^"\']+\.(?:mp4|m3u8|webm|mkv|flv)[^"\']*)["\']',
+                            r'file["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                            # JWPlayer patterns
+                            r'jwplayer\([^)]+\)\.setup\([^}]+file["\']?\s*[:=]\s*["\'](https?://[^"\']+)["\']',
+                            # Video.js patterns
+                            r'videojs\([^)]+\)\.src\(["\'](https?://[^"\']+)["\']',
+                            # Plyr patterns
+                            r'plyr\([^)]+\)\.source\(["\'](https?://[^"\']+)["\']',
+                            # Generic video URL patterns
+                            r'["\'](https?://[^"\']+\.(?:mp4|m3u8|webm|mkv|flv)[^"\']*)["\']',
+                            # Base64 encoded URLs
+                            r'atob\(["\']([^"\']+)["\']',
+                            # JSON data patterns
+                            r'["\']url["\']\s*:\s*["\'](https?://[^"\']+)["\']',
+                            r'["\']src["\']\s*:\s*["\'](https?://[^"\']+)["\']',
+                        ]
+                        
+                        for pattern in patterns:
+                            matches = re.finditer(pattern, script_text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                            for match in matches:
+                                url = match.group(1) if match.groups() else match.group(0)
+                                
+                                # Handle base64 decoding if needed
+                                if 'atob' in pattern:
+                                    try:
+                                        import base64
+                                        url = base64.b64decode(url).decode('utf-8')
+                                    except (ValueError, UnicodeDecodeError, Exception):
+                                        continue
+                                
+                                if url and url.startswith('http'):
+                                    # Verify it's a video URL
+                                    url_lower = url.lower()
+                                    # More lenient check - accept speedostream URLs or any video extension
+                                    if ('speedostream' in url_lower or 
+                                        any(ext in url_lower for ext in ['.mp4', '.m3u8', '.webm', '.mkv', '.flv']) or
+                                        any(keyword in url_lower for keyword in ['video', 'stream', 'cdn', 'play', 'file', 'media', 'embed'])):
+                                        # Exclude non-video domains
+                                        exclude_domains = ['facebook', 'twitter', 'instagram', 'google', 'ads', 'analytics', 'tracking']
+                                        if not any(exclude in url_lower for exclude in exclude_domains):
+                                            logger.debug(f"Found video URL in script: {url[:80]}...")
+                                            return url
+                    
+                    # Method 2: Look for video tag (primary HTML5 player)
+                    video_tag = soup_temp.find('video')
+                    if video_tag:
+                        # Check direct src attributes
+                        for attr in ['src', 'data-src', 'data-url', 'data-video', 'data-file', 'data-source']:
+                            src = video_tag.get(attr)
+                            if src:
+                                if src.startswith('//'):
+                                    src = 'https:' + src
+                                elif src.startswith('/'):
+                                    base_domain = '/'.join(embed_url.split('/')[:3])
+                                    src = base_domain + src
+                                if src.startswith('http'):
+                                    logger.debug(f"Found video URL in video tag ({attr}): {src[:80]}...")
+                                    return src
+                        
+                        # Check source tags within video
+                        source_tags = video_tag.find_all('source')
+                        for source in source_tags:
+                            for attr in ['src', 'data-src', 'data-url']:
+                                src = source.get(attr)
+                                if src:
+                                    if src.startswith('//'):
+                                        src = 'https:' + src
+                                    elif src.startswith('/'):
+                                        base_domain = '/'.join(embed_url.split('/')[:3])
+                                        src = base_domain + src
+                                    if src.startswith('http') and any(ext in src.lower() for ext in ['.mp4', '.m3u8', '.webm', '.mkv']):
+                                        logger.debug(f"Found video URL in source tag: {src[:80]}...")
+                                        return src
+                    
+                    # Method 3: Look for iframe (may contain nested player)
+                    iframes = soup_temp.find_all('iframe')
+                    for iframe in iframes:
+                        for attr in ['src', 'data-src', 'data-url', 'data-iframe']:
+                            iframe_src = iframe.get(attr)
+                            if iframe_src:
+                                if iframe_src.startswith('//'):
+                                    iframe_src = 'https:' + iframe_src
+                                elif iframe_src.startswith('/'):
+                                    base_domain = '/'.join(embed_url.split('/')[:3])
+                                    iframe_src = base_domain + iframe_src
+                                
+                                if iframe_src.startswith('http'):
+                                    # Filter out social media and ads
+                                    exclude_domains = ['facebook', 'twitter', 'instagram', 'youtube.com/channel', 'google', 'ads', 'advertisement', 'analytics']
+                                    if not any(exclude in iframe_src.lower() for exclude in exclude_domains):
+                                        # Recursively resolve
+                                        resolved = await resolve_embed_to_direct(client, iframe_src, max_depth - 1)
+                                        if resolved:
+                                            logger.debug(f"Resolved iframe to: {resolved[:80]}...")
+                                            return resolved
+                    
+                    # Method 4: Look for data attributes on any element
+                    elements_with_data = soup_temp.find_all(attrs=lambda x: x and any(k.startswith('data-') for k in x.keys()))
+                    for elem in elements_with_data:
+                        for attr, value in elem.attrs.items():
+                            if attr.startswith('data-') and isinstance(value, str) and value.startswith('http'):
+                                value_lower = value.lower()
+                                if (any(ext in value_lower for ext in ['.mp4', '.m3u8', '.webm', '.mkv', '.flv']) or
+                                    any(keyword in value_lower for keyword in ['video', 'stream', 'file', 'play', 'media'])):
+                                    logger.debug(f"Found video URL in data attribute ({attr}): {value[:80]}...")
+                                    return value
+                    
+                    # Method 5: Extract from page content using comprehensive regex (fallback)
+                    # Look for any video URLs in the entire page content
+                    video_url_patterns = [
+                        # Speedostream specific patterns (highest priority)
+                        r'https?://[^\s"\'<>\)]*speedostream[^\s"\'<>\)]*\.(?:mp4|m3u8|webm|mkv|flv)(?:\?[^\s"\'<>\)]*)?',
+                        r'https?://[^\s"\'<>\)]*speedostream[^\s"\'<>\)]*/(?:v|video|file|stream|play|media|cdn|embed|e)[^\s"\'<>\)]*',
+                        r'https?://[^\s"\'<>\)]*speedostream[^\s"\'<>\)]*',
+                        # General video file patterns
+                        r'https?://[^\s"\'<>\)]+\.(?:mp4|m3u8|webm|mkv|flv)(?:\?[^\s"\'<>\)]*)?',
+                        r'https?://[^\s"\'<>\)]*/(?:v|video|file|stream|play|media|cdn|embed)[^\s"\'<>\)]*\.(?:mp4|m3u8|webm|mkv|flv)',
+                    ]
+                    
+                    # Collect all matches and prioritize speedostream URLs
+                    all_matches = []
+                    for pattern in video_url_patterns:
+                        matches = re.findall(pattern, text, re.IGNORECASE)
+                        all_matches.extend(matches)
+                    
+                    # Sort matches: speedostream URLs first, then by extension preference
+                    def url_priority(url):
+                        url_lower = url.lower()
+                        priority = 0
+                        if 'speedostream' in url_lower:
+                            priority += 1000
+                        if '.mp4' in url_lower:
+                            priority += 100
+                        elif '.m3u8' in url_lower:
+                            priority += 90
+                        elif '.webm' in url_lower:
+                            priority += 80
+                        return priority
+                    
+                    all_matches.sort(key=url_priority, reverse=True)
+                    
+                    for match in all_matches:
+                        match_lower = match.lower()
+                        # Prefer speedostream URLs or URLs with video indicators
+                        if ('speedostream' in match_lower or 
+                            any(ext in match_lower for ext in ['.mp4', '.m3u8', '.webm', '.mkv', '.flv']) or
+                            any(keyword in match_lower for keyword in ['video', 'stream', 'cdn', 'play', 'file', 'embed'])):
+                            # Exclude non-video URLs
+                            exclude_domains = ['facebook', 'twitter', 'instagram', 'google', 'ads', 'analytics', 'tracking', 'pixel']
+                            if not any(exclude in match_lower for exclude in exclude_domains):
+                                logger.debug(f"Found video URL via regex: {match[:80]}...")
+                                return match
+                            
+            except Exception as e:
+                logger.debug(f"Speedostream resolution attempt failed: {e}", exc_info=True)
         
         # Trembed pattern (common in hindilinks4u)
         if 'trembed' in embed_url_lower or '/embed/' in embed_url_lower:
@@ -891,7 +1127,7 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
     servers = []  # New structured server list
     
     # Comprehensive video server extraction with metadata
-    # Enhanced for new hindilinks4u.delivery structure with "Server 1", "Server 2" format
+    # Enhanced for hindilinks4u.host structure with "Server 1", "Server 2" format
     # 1. Look for server selection buttons/links (most reliable for server names)
     server_selectors = [
         # New format: Look for elements with "Server 1", "Server 2" text
@@ -984,8 +1220,10 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
                     if any(path in href.lower() for path in non_video_paths):
                         continue
                     
-                    # Check if it's a valid streaming link
-                    streaming_domains = ['stream', 'embed', 'player', 'watch', 'video', 'play', 'server', 'cdn', 'mp4', 'm3u8']
+                    # Check if it's a valid streaming link (enhanced with speedostream and other hosts)
+                    streaming_domains = ['stream', 'embed', 'player', 'watch', 'video', 'play', 'server', 'cdn', 'mp4', 'm3u8', 
+                                        'speedostream', 'doodstream', 'dood', 'streamtape', 'mixdrop', 'vidstream', 'vidcloud',
+                                        'gounlimited', 'upstream', 'vidoza', 'streamwish', 'filemoon', 'streamhub']
                     is_streaming = any(domain in href.lower() for domain in streaming_domains) or 'episode' in href.lower() or 'movie' in href.lower()
                     
                     if is_streaming and href not in processed_urls:
@@ -1125,8 +1363,10 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
                 if url and url.startswith(('http://', 'https://')):
                     exclude_keywords = ['login', 'signup', 'advert', 'advertisement', 'facebook', 'twitter', 'instagram', 'analytics', 'tracking', 'google-analytics']
                     if not any(exclude in url.lower() for exclude in exclude_keywords):
-                        # Check if it looks like a video URL
-                        video_indicators = ['stream', 'embed', 'player', 'watch', 'video', 'play', 'server', 'cdn', 'mp4', 'm3u8', 'webm', 'mkv', 'dood', 'streamtape', 'mixdrop']
+                        # Check if it looks like a video URL (enhanced with speedostream and other hosts)
+                        video_indicators = ['stream', 'embed', 'player', 'watch', 'video', 'play', 'server', 'cdn', 'mp4', 'm3u8', 'webm', 'mkv', 
+                                          'dood', 'streamtape', 'mixdrop', 'speedostream', 'vidstream', 'vidcloud', 'gounlimited', 
+                                          'upstream', 'vidoza', 'streamwish', 'filemoon', 'streamhub']
                         if any(indicator in url.lower() for indicator in video_indicators):
                             if url not in processed_urls:
                                 processed_urls.add(url)
@@ -1197,8 +1437,10 @@ def parse_episode(soup: BeautifulSoup, logger, series_slug: str, season: int, ep
                 elif not href.startswith(('http://', 'https://')):
                     continue
                     
-                # Enhanced keyword matching
-                video_keywords = ['watch', 'stream', 'play', 'download', 'server', 'embed', 'player', 'video', 'mp4', 'm3u8', 'dood', 'streamtape', 'mixdrop', 'vidstream', 'gounlimited']
+                # Enhanced keyword matching (includes speedostream and other hosts)
+                video_keywords = ['watch', 'stream', 'play', 'download', 'server', 'embed', 'player', 'video', 'mp4', 'm3u8', 
+                                'dood', 'streamtape', 'mixdrop', 'vidstream', 'gounlimited', 'speedostream', 'vidcloud',
+                                'upstream', 'vidoza', 'streamwish', 'filemoon', 'streamhub']
                 if any(keyword in text or keyword in href.lower() for keyword in video_keywords):
                     exclude_keywords = ['login', 'signup', 'advert', 'advertisement', 'facebook', 'twitter', 'instagram', 'analytics', 'tracking']
                     if not any(exclude in href.lower() for exclude in exclude_keywords):
@@ -1257,66 +1499,318 @@ async def scrape_episode_data(
     if season < 1 or episode < 1:
         raise HTTPException(status_code=400, detail="Season and episode must be positive integers")
 
-    # Try multiple URL patterns for the new domain structure
-    # Pattern 1: Standard format: /episode/{series}-season-{s}-episode-{e}/
-    # Pattern 2: New format with part: /{series}-{year}-season-{s}-part-{e}-{lang}-dubbed-Watch-online-full-movie/
-    # Pattern 3: New format episode: /{series}-{year}-season-{s}-episode-{e}-{lang}-dubbed-Watch-online-full-movie/
-    
-    url_patterns = [
-        f"{HINDILINKS_BASE_URL}/episode/{series_slug}-season-{season}-episode-{episode}/",
-        f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-episode-{episode}/",
-        f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-part-{episode}-hindi-dubbed-Watch-online-full-movie/",
-        f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-episode-{episode}-hindi-dubbed-Watch-online-full-movie/",
-    ]
-    
-    # Add language-specific patterns if language is provided
-    if language:
-        lang_slug = language.lower()
-        url_patterns.extend([
-            f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-part-{episode}-{lang_slug}-dubbed-Watch-online-full-movie/",
-            f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-episode-{episode}-{lang_slug}-dubbed-Watch-online-full-movie/",
-        ])
-    
     semaphore = asyncio.Semaphore(5)
     last_error = None
+    episode_data = None
+    episode_url = None
+    
+    # Extract year from series_slug if present (e.g., "stranger-things-2025" -> base="stranger-things", year="2025")
+    base_slug = series_slug
+    extracted_year = None
+    year_match = re.search(r'-(\d{4})$', series_slug)
+    if year_match:
+        extracted_year = year_match.group(1)
+        base_slug = series_slug[:-len(f'-{extracted_year}')]
 
     async with semaphore:
-        for url in url_patterns:
-            try:
-                logger.info(f"Trying episode URL: {url}")
-                await asyncio.sleep(1)
-                response = await client.get(url, follow_redirects=True)
+        # Method 1: First try to get the actual episode URL from series detail page (most reliable)
+        try:
+            
+            # Try both with and without year in series detail URL (base_slug is already defined above)
+            series_detail_urls = [
+                f"{HINDILINKS_BASE_URL}/series/{base_slug}/",
+                f"{HINDILINKS_BASE_URL}/series/{series_slug}/",
+            ]
+            
+            response = None
+            for detail_url in series_detail_urls:
+                try:
+                    logger.info(f"Attempting to get episode URL from series detail page: {detail_url}")
+                    response = await client.get(detail_url, follow_redirects=True, timeout=20.0)
+                    if response.status_code == 200:
+                        break
+                except (HTTPStatusError, RequestError, Exception):
+                    continue
+            
+            if response and response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                # Look for episode links matching the season and episode number
+                episode_links = soup.find_all('a', href=True)
                 
-                # Check if we got redirected to a different domain
-                final_url = str(response.url)
-                if 'hindilinks4u.delivery' in final_url and 'hindilinks4u.host' in url:
-                    # Update base URL if we got redirected
-                    logger.info(f"Detected redirect to new domain: {final_url}")
+                for link in episode_links:
+                    href = link.get('href', '')
+                    if not href:
+                        continue
+                    
+                    # Normalize URL
+                    if href.startswith('//'):
+                        href = 'https:' + href
+                    elif href.startswith('/'):
+                        href = HINDILINKS_BASE_URL + href
+                    elif not href.startswith(('http://', 'https://')):
+                        continue
+                    
+                    # Check if URL matches our season and episode
+                    href_lower = href.lower()
+                    # Match patterns like: season-{season}-episode-{episode} or season-{season}-part-{episode}
+                    # Also handle patterns with year: {year}-season-{season}-part-{episode}
+                    # Enhanced patterns to better detect part vs episode - prioritize part format
+                    season_patterns = [
+                        # Part format (most common for newer content) - highest priority
+                        rf'season[-\s]*{season}[-\s]*part[-\s]*{episode}\b',
+                        rf's{season}[-\s]*part[-\s]*{episode}\b',
+                        rf'part[-\s]*{episode}[-\s]*season[-\s]*{season}\b',
+                        rf'part[-\s]*{episode}[-\s]*s{season}\b',
+                        # Episode format
+                        rf'season[-\s]*{season}[-\s]*episode[-\s]*{episode}\b',
+                        rf's{season}[-\s]*episode[-\s]*{episode}\b',
+                        rf'episode[-\s]*{episode}[-\s]*season[-\s]*{season}\b',
+                        rf'episode[-\s]*{episode}[-\s]*s{season}\b',
+                        # Generic patterns (ep, e, etc.)
+                        rf'season[-\s]*{season}[-\s]*(?:ep|e)[-\s]*{episode}\b',
+                        rf's{season}[-\s]*(?:ep|e)[-\s]*{episode}\b',
+                        # Combined patterns with year
+                        rf'\d{{4}}[-\s]*season[-\s]*{season}[-\s]*part[-\s]*{episode}\b',
+                        rf'\d{{4}}[-\s]*season[-\s]*{season}[-\s]*episode[-\s]*{episode}\b',
+                        # Combined patterns
+                        rf'season[-\s]*{season}[-\s]*(?:episode|part|ep)[-\s]*{episode}\b',
+                    ]
+                    
+                    for pattern in season_patterns:
+                        if re.search(pattern, href_lower, re.IGNORECASE):
+                            # Also check if series slug is in URL (more flexible matching)
+                            series_slug_variations = [
+                                series_slug.lower(),
+                                series_slug.replace('-', ' ').lower(),
+                                series_slug.replace('-', '').lower(),
+                                series_slug.replace(' ', '-').lower(),
+                            ]
+                            if any(var in href_lower for var in series_slug_variations) or not series_slug:
+                                episode_url = href
+                                logger.info(f"Found episode URL from series page: {episode_url}")
+                                break
+                    if episode_url:
+                        break
+                
+                # Alternative: Look in episode containers
+                if not episode_url:
+                    season_divs = soup.find_all('div', class_='se-c') or soup.find_all('div', id=lambda x: x and 'season' in str(x).lower())
+                    for season_div in season_divs:
+                        # Check if this is the right season
+                        season_text = season_div.get_text() if hasattr(season_div, 'get_text') else ''
+                        if f'season {season}' in season_text.lower() or f's{season}' in season_text.lower():
+                            # Find episode links in this season
+                            ep_links = season_div.find_all('a', href=True)
+                            for ep_link in ep_links:
+                                href = ep_link.get('href', '')
+                                if not href:
+                                    continue
+                                
+                                # Normalize URL
+                                if href.startswith('//'):
+                                    href = 'https:' + href
+                                elif href.startswith('/'):
+                                    href = HINDILINKS_BASE_URL + href
+                                elif not href.startswith(('http://', 'https://')):
+                                    continue
+                                
+                                # Check episode number in URL or text
+                                href_lower = href.lower()
+                                ep_text = ep_link.get_text().lower()
+                                
+                                # Match episode number (more flexible patterns - prioritize part format)
+                                ep_patterns = [
+                                    rf'part[-\s]*{episode}\b',  # Part format (highest priority for newer content)
+                                    rf'part[-\s]*{episode}[-\s]*(?:hindi|english|dubbed)',  # Part with language
+                                    rf'episode[-\s]*{episode}\b',  # Episode format
+                                    rf'episode[-\s]*{episode}[-\s]*(?:hindi|english|dubbed)',  # Episode with language
+                                    rf'(?:ep|e)[-\s]*{episode}\b',  # Short forms
+                                    rf'(?:episode|ep|part|e)[-\s]*{episode}\b',  # Generic
+                                    rf'\b{episode}\b',  # Just the number if context suggests it's an episode
+                                ]
+                                
+                                for pattern in ep_patterns:
+                                    ep_match = re.search(pattern, href_lower + ' ' + ep_text, re.IGNORECASE)
+                                    if ep_match:
+                                        # Additional validation: check if season matches
+                                        season_match = re.search(rf'season[-\s]*{season}|s{season}\b', href_lower + ' ' + ep_text, re.IGNORECASE)
+                                        if season_match or not season_match:  # Allow if season is not specified in link
+                                            episode_url = href
+                                            logger.info(f"Found episode URL from season container: {episode_url}")
+                                            break
+                                if episode_url:
+                                    break
+                            
+                            if episode_url:
+                                break
+        except Exception as e:
+            logger.debug(f"Could not get episode URL from series page: {e}")
+        
+        # Method 2: If we found an episode URL, use it directly
+        if episode_url:
+            try:
+                logger.info(f"Trying episode URL from series page: {episode_url}")
+                await asyncio.sleep(0.5)
+                response = await client.get(episode_url, follow_redirects=True, timeout=20.0)
                 
                 if response.status_code == 200:
                     soup = BeautifulSoup(response.text, 'html.parser')
-                    # Check if page actually has content (not a 404 page)
                     title_tag = soup.find('h1') or soup.find('title')
                     if title_tag and '404' not in title_tag.text.lower() and 'not found' not in title_tag.text.lower():
                         episode_data = parse_episode(soup, logger, series_slug, season, episode)
-                        break
-                elif response.status_code == 404:
-                    continue  # Try next pattern
-                else:
-                    response.raise_for_status()
-            except HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    last_error = e
-                    continue  # Try next pattern
-                last_error = e
             except Exception as e:
-                last_error = e
-                continue
+                logger.debug(f"Failed to fetch episode from found URL: {e}")
         
-        # If we got here without breaking, all patterns failed
-        if 'episode_data' not in locals():
+        # Method 3: Try multiple URL patterns if we haven't found the episode yet
+        if not episode_data:
+            # Build comprehensive URL patterns based on actual website structure
+            # Priority order: Most specific patterns first (part format with year and language)
+            # base_slug and extracted_year are already defined at function start
+            url_patterns = []
+            
+            # Pattern 1: Part format with year and language (highest priority - matches actual site structure)
+            # Example: stranger-things-2025-season-5-part-3-hindi-dubbed-Watch-online-full-movie/
+            # Try with extracted year first, then common years
+            years_to_try = []
+            if extracted_year:
+                years_to_try.append(extracted_year)  # Prioritize extracted year
+            years_to_try.extend(['2025', '2024', '2023', '2022', '2021', '2020', '2019', '2018'])
+            
+            for year in years_to_try:
+                # Part format (most common for newer content) - use base_slug
+                url_patterns.extend([
+                    f"{HINDILINKS_BASE_URL}/{base_slug}-{year}-season-{season}-part-{episode}-hindi-dubbed-Watch-online-full-movie/",
+                    f"{HINDILINKS_BASE_URL}/{base_slug}-{year}-season-{season}-part-{episode}-english-dubbed-Watch-online-full-movie/",
+                    f"{HINDILINKS_BASE_URL}/{base_slug}-{year}-season-{season}-part-{episode}-Watch-online-full-movie/",
+                ])
+                # Episode format
+                url_patterns.extend([
+                    f"{HINDILINKS_BASE_URL}/{base_slug}-{year}-season-{season}-episode-{episode}-hindi-dubbed-Watch-online-full-movie/",
+                    f"{HINDILINKS_BASE_URL}/{base_slug}-{year}-season-{season}-episode-{episode}-english-dubbed-Watch-online-full-movie/",
+                    f"{HINDILINKS_BASE_URL}/{base_slug}-{year}-season-{season}-episode-{episode}-Watch-online-full-movie/",
+                ])
+            
+            # Also try with original series_slug (in case year is already in slug and shouldn't be added)
+            if extracted_year:
+                url_patterns.extend([
+                    f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-part-{episode}-hindi-dubbed-Watch-online-full-movie/",
+                    f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-part-{episode}-english-dubbed-Watch-online-full-movie/",
+                    f"{HINDILINKS_BASE_URL}/{series_slug}-season-{season}-part-{episode}-Watch-online-full-movie/",
+                ])
+            
+            # Pattern 2: Part format without year (second priority) - use base_slug
+            url_patterns.extend([
+                f"{HINDILINKS_BASE_URL}/{base_slug}-season-{season}-part-{episode}-hindi-dubbed-Watch-online-full-movie/",
+                f"{HINDILINKS_BASE_URL}/{base_slug}-season-{season}-part-{episode}-english-dubbed-Watch-online-full-movie/",
+                f"{HINDILINKS_BASE_URL}/{base_slug}-season-{season}-part-{episode}-Watch-online-full-movie/",
+            ])
+            
+            # Pattern 3: Episode format without year
+            url_patterns.extend([
+                f"{HINDILINKS_BASE_URL}/{base_slug}-season-{season}-episode-{episode}-hindi-dubbed-Watch-online-full-movie/",
+                f"{HINDILINKS_BASE_URL}/{base_slug}-season-{season}-episode-{episode}-english-dubbed-Watch-online-full-movie/",
+                f"{HINDILINKS_BASE_URL}/{base_slug}-season-{season}-episode-{episode}-Watch-online-full-movie/",
+            ])
+            
+            # Pattern 4: Language-specific patterns if language is provided
+            if language:
+                lang_slug = language.lower()
+                for year in years_to_try[:6]:  # Limit to first 6 years to avoid too many patterns
+                    url_patterns.extend([
+                        f"{HINDILINKS_BASE_URL}/{base_slug}-{year}-season-{season}-part-{episode}-{lang_slug}-dubbed-Watch-online-full-movie/",
+                        f"{HINDILINKS_BASE_URL}/{base_slug}-{year}-season-{season}-episode-{episode}-{lang_slug}-dubbed-Watch-online-full-movie/",
+                    ])
+                url_patterns.extend([
+                    f"{HINDILINKS_BASE_URL}/{base_slug}-season-{season}-part-{episode}-{lang_slug}-dubbed-Watch-online-full-movie/",
+                    f"{HINDILINKS_BASE_URL}/{base_slug}-season-{season}-episode-{episode}-{lang_slug}-dubbed-Watch-online-full-movie/",
+                ])
+            
+            # Pattern 5: Standard formats (fallback) - try both base_slug and original series_slug
+            url_patterns.extend([
+                f"{HINDILINKS_BASE_URL}/episode/{base_slug}-season-{season}-episode-{episode}/",
+                f"{HINDILINKS_BASE_URL}/episode/{base_slug}-season-{season}-part-{episode}/",
+                f"{HINDILINKS_BASE_URL}/{base_slug}-season-{season}-episode-{episode}/",
+                f"{HINDILINKS_BASE_URL}/{base_slug}-season-{season}-part-{episode}/",
+            ])
+            
+            # Pattern 6: Additional variations with different year formats and language combinations
+            # Try more year variations with base_slug
+            for year in years_to_try[:4]:  # Limit to avoid too many patterns
+                url_patterns.extend([
+                    f"{HINDILINKS_BASE_URL}/{base_slug}-{year}-season-{season}-part-{episode}/",
+                    f"{HINDILINKS_BASE_URL}/{base_slug}-{year}-season-{season}-episode-{episode}/",
+                ])
+            
+            # Pattern 7: Try with old domain as absolute last resort (only after all .host patterns fail)
+            # This will be tried separately after all .host patterns are exhausted
+            
+            # Try each pattern
+            for url in url_patterns:
+                try:
+                    logger.info(f"Trying episode URL: {url}")
+                    await asyncio.sleep(0.5)
+                    response = await client.get(url, follow_redirects=True, timeout=20.0)
+                    
+                    # Check if we got redirected to a different domain
+                    final_url = str(response.url)
+                    if 'hindilinks4u.delivery' in final_url and 'hindilinks4u.host' in url:
+                        logger.info(f"Detected redirect from .host to .delivery: {final_url}")
+                    elif 'hindilinks4u.host' in final_url and 'hindilinks4u.delivery' in url:
+                        logger.info(f"Detected redirect from .delivery to .host: {final_url}")
+                    
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        # Check if page actually has content (not a 404 page)
+                        title_tag = soup.find('h1') or soup.find('title')
+                        if title_tag and '404' not in title_tag.text.lower() and 'not found' not in title_tag.text.lower():
+                            episode_data = parse_episode(soup, logger, series_slug, season, episode)
+                            break
+                    elif response.status_code == 404:
+                        continue  # Try next pattern
+                    else:
+                        response.raise_for_status()
+                except HTTPStatusError as e:
+                    if e.response and e.response.status_code == 404:
+                        last_error = e
+                        continue  # Try next pattern
+                    last_error = e
+                except Exception as e:
+                    last_error = e
+                    continue
+        
+        # If we got here without finding episode data, try old domain as absolute last resort
+        if not episode_data:
+            logger.info(f"All .host patterns failed, trying .delivery domain as last resort")
+            old_domain_patterns = []
+            if extracted_year:
+                old_domain_patterns.extend([
+                    f"{HINDILINKS_OLD_BASE_URL}/{base_slug}-{extracted_year}-season-{season}-part-{episode}-hindi-dubbed-Watch-online-full-movie/",
+                ])
+            old_domain_patterns.extend([
+                f"{HINDILINKS_OLD_BASE_URL}/{base_slug}-2025-season-{season}-part-{episode}-hindi-dubbed-Watch-online-full-movie/",
+                f"{HINDILINKS_OLD_BASE_URL}/{base_slug}-season-{season}-part-{episode}-hindi-dubbed-Watch-online-full-movie/",
+            ])
+            
+            for url in old_domain_patterns:
+                try:
+                    logger.info(f"Trying old domain episode URL: {url}")
+                    await asyncio.sleep(0.5)
+                    response = await client.get(url, follow_redirects=True, timeout=20.0)
+                    
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        title_tag = soup.find('h1') or soup.find('title')
+                        if title_tag and '404' not in title_tag.text.lower() and 'not found' not in title_tag.text.lower():
+                            episode_data = parse_episode(soup, logger, series_slug, season, episode)
+                            break
+                except Exception as e:
+                    logger.debug(f"Old domain pattern failed: {e}")
+                    continue
+        
+        # If we still don't have episode data, raise error
+        if not episode_data:
             if last_error:
-                if isinstance(last_error, HTTPStatusError) and last_error.response.status_code == 404:
+                if isinstance(last_error, HTTPStatusError) and last_error.response and last_error.response.status_code == 404:
                     raise HTTPException(
                         status_code=404,
                         detail=f"Episode not found for {series_slug} season {season} episode {episode}"
@@ -1328,22 +1822,37 @@ async def scrape_episode_data(
             )
         
         try:
-
-            # Deep resolve embed URLs to direct playable links
+            # Deep resolve embed URLs to direct playable links (enhanced resolution)
             resolved_servers = []
             for server in episode_data.servers:
                 server_url_str = str(server.url)
-                if server.type in ['embed', 'iframe'] or '/embed/' in server_url_str.lower() or 'embed' in server_url_str.lower():
-                    # Try to resolve embed URL to direct link
-                    resolved_url = await resolve_embed_to_direct(client, server_url_str, max_depth=2)
+                server_url_lower = server_url_str.lower()
+                
+                # Check if it needs resolution (embed, iframe, or known video hosts)
+                needs_resolution = (
+                    server.type in ['embed', 'iframe'] or 
+                    '/embed/' in server_url_lower or 
+                    'embed' in server_url_lower or
+                    'speedostream' in server_url_lower or
+                    any(host in server_url_lower for host in [
+                        'doodstream', 'dood', 'streamtape', 'mixdrop', 'vidstream', 'vidcloud',
+                        'gounlimited', 'upstream', 'vidoza', 'streamwish', 'filemoon', 'streamhub',
+                        'trembed', 'player', 'watch'
+                    ])
+                )
+                
+                if needs_resolution:
+                    # Try to resolve embed URL to direct link (increased depth for thorough resolution)
+                    resolved_url = await resolve_embed_to_direct(client, server_url_str, max_depth=3)
                     if resolved_url and resolved_url != server_url_str:
                         # Use resolved URL if different
                         resolved_servers.append(StreamingServer(
                             name=server.name,
                             url=resolved_url,
                             quality=server.quality,
-                            type="direct" if resolved_url else server.type
+                            type="direct"
                         ))
+                        logger.debug(f"Resolved {server_url_str[:50]}... to {resolved_url[:50]}...")
                     else:
                         # Keep original if resolution failed or same
                         resolved_servers.append(server)
@@ -1368,23 +1877,27 @@ async def scrape_episode_data(
                         detail=f"Episode not available in {language} for {series_slug} season {season} episode {episode}"
                     )
                 
-            logger.info(f"Scraped episode data for {series_slug} S{season:02d}E{episode:02d}, language: {episode_data.language}")
+            logger.info(f"Scraped episode data for {series_slug} S{season:02d}E{episode:02d}, language: {episode_data.language}, servers: {len(resolved_servers)}")
             return episode_data
         except HTTPStatusError as e:
-            logger.error(f"HTTP error while scraping {url}: {e}")
-            if e.response.status_code == 404:
+            url_info = episode_url if episode_url else f"episode {series_slug} S{season}E{episode}"
+            logger.error(f"HTTP error while scraping {url_info}: {e}")
+            status_code = e.response.status_code if e.response else 502
+            if status_code == 404:
                 raise HTTPException(
                     status_code=404,
                     detail=f"Episode not found for {series_slug} season {season} episode {episode}"
                 )
             raise HTTPException(status_code=502, detail=f"Failed to fetch data: {str(e)}")
         except RequestError as e:
-            logger.error(f"Network error while scraping {url}: {e}")
+            url_info = episode_url if episode_url else f"episode {series_slug} S{season}E{episode}"
+            logger.error(f"Network error while scraping {url_info}: {e}")
             raise HTTPException(status_code=503, detail=f"Network error: {str(e)}")
         except HTTPException as e:
             raise e
         except Exception as e:
-            logger.error(f"Unexpected error while scraping {url}: {e}")
+            url_info = episode_url if episode_url else f"episode {series_slug} S{season}E{episode}"
+            logger.error(f"Unexpected error while scraping {url_info}: {e}")
             raise HTTPException(status_code=500, detail=f"Scraping error: {str(e)}")
 
 # Helper function to parse series detail
@@ -1522,25 +2035,36 @@ def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_
             # Extract episode title
             ep_title = ep_link.text.strip() if hasattr(ep_link, 'text') else (ep.text.strip() if hasattr(ep, 'text') else f"Episode {season_episode_map[season_num] + 1}")
             
-            # Extract episode number from URL (most reliable)
+            # Extract episode number from URL (most reliable) - handle both episode and part formats
             ep_num = None
             try:
-                # URL format: .../episode/{series}-season-{s}-episode-{e}/
-                if 'season-' in ep_url and 'episode-' in ep_url:
-                    # Extract season and episode from URL
+                # URL format: .../episode/{series}-season-{s}-episode-{e}/ or .../{series}-season-{s}-part-{e}/
+                # Prioritize part format (more common for newer content)
+                if 'season-' in ep_url:
+                    # Extract season and episode/part from URL
                     url_parts = ep_url.split('/')
                     for part in url_parts:
-                        if 'episode-' in part:
-                            ep_match = re.search(r'episode-(\d+)', part, re.IGNORECASE)
-                            if ep_match:
-                                ep_num = ep_match.group(1)
-                                break
+                        # Try part format first (higher priority)
+                        part_match = re.search(r'part-(\d+)', part, re.IGNORECASE)
+                        if part_match:
+                            ep_num = part_match.group(1)
+                            break
+                        # Then try episode format
+                        ep_match = re.search(r'episode-(\d+)', part, re.IGNORECASE)
+                        if ep_match:
+                            ep_num = ep_match.group(1)
+                            break
                 
-                # Fallback: extract from title
+                # Fallback: extract from title (handle both part and episode)
                 if not ep_num:
-                    ep_match = re.search(r'(?:episode|ep)[\s:]*(\d+)', ep_title, re.IGNORECASE)
-                    if ep_match:
-                        ep_num = ep_match.group(1)
+                    # Try part format first
+                    part_match = re.search(r'part[\s:]*(\d+)', ep_title, re.IGNORECASE)
+                    if part_match:
+                        ep_num = part_match.group(1)
+                    else:
+                        ep_match = re.search(r'(?:episode|ep)[\s:]*(\d+)', ep_title, re.IGNORECASE)
+                        if ep_match:
+                            ep_num = ep_match.group(1)
                 
                 # Final fallback: use counter
                 if not ep_num:
@@ -1603,13 +2127,15 @@ def parse_series_detail(soup: BeautifulSoup, logger, series_slug: str, original_
             elif not ep_url.startswith(('http://', 'https://')):
                 ep_url = HINDILINKS_BASE_URL + '/' + ep_url.lstrip('/')
             
-            # Extract season and episode from URL
+            # Extract season and episode/part from URL - handle both formats
             season_match = re.search(r'season-(\d+)', ep_url, re.IGNORECASE)
+            # Prioritize part format, then episode format
+            part_match = re.search(r'part-(\d+)', ep_url, re.IGNORECASE)
             episode_match = re.search(r'episode-(\d+)', ep_url, re.IGNORECASE)
             
-            if season_match and episode_match:
+            if season_match and (part_match or episode_match):
                 season_num = season_match.group(1)
-                ep_num = episode_match.group(1)
+                ep_num = part_match.group(1) if part_match else episode_match.group(1)
                 ep_title = ep_link.text.strip() or f"Episode {ep_num}"
                 
                 # Extract image
@@ -1731,11 +2257,14 @@ async def scrape_series_detail(series_slug: str, client: AsyncClient, include_se
                                 language=ep.language,
                                 servers=episode_data.servers
                             )
+                        else:
+                            # Could not extract season/episode from URL, return original
+                            logger.debug(f"Could not extract season/episode from URL: {url_str}")
+                            return ep
                     except Exception as e:
                         logger.warning(f"Failed to fetch servers for episode {ep.episode_number}: {e}")
                         # Return original episode without servers
-                    
-                    return ep
+                        return ep
                 
                 # Fetch all episodes concurrently (limit concurrency)
                 semaphore_episodes = asyncio.Semaphore(10)  # Limit concurrent episode fetches
@@ -1754,7 +2283,8 @@ async def scrape_series_detail(series_slug: str, client: AsyncClient, include_se
             
         except HTTPStatusError as e:
             logger.error(f"HTTP error while scraping {url}: {e}")
-            if e.response.status_code == 404:
+            status_code = e.response.status_code if e.response else 502
+            if status_code == 404:
                 raise HTTPException(status_code=404, detail="Series not found")
             raise HTTPException(status_code=502, detail=f"Failed to fetch data: {str(e)}")
         except Exception as e:
@@ -2110,7 +2640,8 @@ async def scrape_anime_by_category(anime_category: str, page: int, client: Async
         
         except HTTPStatusError as e:
             logger.error(f"HTTP error while scraping {url}: {e}")
-            if e.response.status_code == 404:
+            status_code = e.response.status_code if e.response else 502
+            if status_code == 404:
                 raise HTTPException(status_code=404, detail=f"Category '{anime_category}' not found or page {page} does not exist")
             raise HTTPException(status_code=502, detail=f"Failed to fetch data: {str(e)}")
         except RequestError as e:
@@ -3541,7 +4072,8 @@ async def scrape_toonstream_movie_detail(movie_slug: str, client: AsyncClient) -
             
         except HTTPStatusError as e:
             logger.error(f"HTTP error while scraping {url}: {e}")
-            if e.response.status_code == 404:
+            status_code = e.response.status_code if e.response else 502
+            if status_code == 404:
                 raise HTTPException(status_code=404, detail=f"Movie not found: {movie_slug}")
             raise HTTPException(status_code=502, detail=f"Failed to fetch data: {str(e)}")
         except Exception as e:
