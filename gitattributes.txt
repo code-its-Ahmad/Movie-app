@@ -55,3 +55,39 @@
 *.reason filter=lfs diff=lfs merge=lfs -text
 *.lxo filter=lfs diff=lfs merge=lfs -text
 *.bc filter=lfs diff=lfs merge=lfs -text
+
+# Python common large/ignore stuff
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Data & big files (very important!)
+data/
+dataset/
+*.csv
+*.json  # ← remove this line if your JSON files are small & important
+*.parquet
+*.hdf5
+*.pickle
+*.pkl
+*.ipynb_checkpoints/
+*.log
+
+# IDE / editor stuff
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# If you have node stuff (sometimes mixed in Python repos)
+node_modules/
