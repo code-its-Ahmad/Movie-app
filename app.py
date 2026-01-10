@@ -25,6 +25,7 @@ from scraper import (
     normalize_movie_slug,
     extract_movie_slug_from_url,
     scrape_series_detail,
+    resolve_embed_to_direct,
 )
 from httpx import AsyncClient
 
@@ -296,102 +297,6 @@ async def get_episode_data(
     logger.info(f"Processing request for series: {series_slug}, season: {season}, episode: {episode}, language: {language}")
     episode_data = await scrape_episode_data(series_slug, season, episode, client, language)
     return episode_data
-
-@app.post(
-    "/episodes/batch-servers",
-    response_model=List[EpisodeServerResponse],
-    responses={
-        400: {"model": ErrorResponse, "description": "Invalid request data"},
-        500: {"model": ErrorResponse, "description": "Internal server error"},
-    },
-    summary="Get server links for multiple episodes (hindilinks4u)",
-    description="Fetch server links for multiple episodes in a single request. Useful for frontend to load all episode server links efficiently. All server links are automatically resolved to direct playable URLs."
-)
-async def get_batch_episode_servers(
-    episodes: List[EpisodeRequest],
-    client: AsyncClient = Depends(get_http_client)
-):
-    """
-    Fetch server links for multiple episodes concurrently with automatic direct link resolution.
-    
-    This endpoint allows the frontend to request server links for multiple episodes
-    at once, reducing the number of API calls and improving performance.
-    
-    Each episode in the request will be processed, and server links will be returned
-    with all embed URLs automatically resolved to direct playable links.
-    If an episode fails to fetch, an error message will be included in the response
-    for that specific episode.
-    """
-    if not episodes:
-        raise HTTPException(status_code=400, detail="At least one episode must be provided")
-    
-    if len(episodes) > 50:  # Limit batch size
-        raise HTTPException(status_code=400, detail="Maximum 50 episodes per batch request")
-    
-    import asyncio
-    
-    async def fetch_episode_servers(ep_req: EpisodeRequest) -> EpisodeServerResponse:
-        """Fetch servers for a single episode with deep link resolution"""
-        try:
-            # Normalize series slug
-            series_slug = re.sub(r'\s+', '-', ep_req.series_slug.strip().lower())
-            series_slug = re.sub(r'[^\w-]', '', series_slug)
-            
-            if not series_slug:
-                return EpisodeServerResponse(
-                    series_slug=ep_req.series_slug,
-                    season=ep_req.season,
-                    episode=ep_req.episode,
-                    servers=[],
-                    error="Invalid series slug"
-                )
-            
-            # Validate language if provided
-            language = None
-            if ep_req.language:
-                language = re.sub(r'[^\w\s]', '', ep_req.language.strip().lower())
-                if language and language not in SUPPORTED_LANGUAGES:
-                    language = None  # Ignore invalid language
-            
-            # Fetch episode data (already includes server link resolution)
-            episode_data = await scrape_episode_data(
-                series_slug, 
-                ep_req.season, 
-                ep_req.episode, 
-                client, 
-                language
-            )
-            
-            return EpisodeServerResponse(
-                series_slug=series_slug,
-                season=ep_req.season,
-                episode=ep_req.episode,
-                servers=episode_data.servers,
-                error=None
-            )
-        except HTTPException as e:
-            return EpisodeServerResponse(
-                series_slug=ep_req.series_slug,
-                season=ep_req.season,
-                episode=ep_req.episode,
-                servers=[],
-                error=f"HTTP {e.status_code}: {e.detail}"
-            )
-        except Exception as e:
-            logger.error(f"Error fetching servers for {ep_req.series_slug} S{ep_req.season}E{ep_req.episode}: {e}")
-            return EpisodeServerResponse(
-                series_slug=ep_req.series_slug,
-                season=ep_req.season,
-                episode=ep_req.episode,
-                servers=[],
-                error=f"Error: {str(e)}"
-            )
-    
-    # Fetch all episodes concurrently
-    logger.info(f"Processing batch request for {len(episodes)} episodes")
-    results = await asyncio.gather(*[fetch_episode_servers(ep) for ep in episodes])
-    
-    return results
 
 @app.post(
     "/anime/episodes/batch-servers",
